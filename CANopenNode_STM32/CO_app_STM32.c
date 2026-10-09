@@ -266,14 +266,14 @@ canopen_app_process(void) {
 #endif
 
     if (reset_status == CO_RESET_COMM) {
-        /* delete objects from memory */
+        /* The same objects are initialized again, as in the examples of CANopenNode, instead of
+         * deleted and allocated again (CO_delete, canopen_app_init): the application keeps pointers to
+         * them (the SDO clients of the controller's request task and firmware update) */
         if (canopenNodeSTM32->timerHandle != NULL) {
             HAL_TIM_Base_Stop_IT(canopenNodeSTM32->timerHandle);
         }
-        CO_CANsetConfigurationMode((void*)canopenNodeSTM32);
-        CO_delete(CO);
         log_printf("CANopenNode Reset Communication request\n");
-        canopen_app_init(canopenNodeSTM32); // Reset Communication routine
+        canopen_app_resetCommunication(); // Reset Communication routine
         return 0;
     } else if (reset_status == CO_RESET_APP) {
         log_printf("CANopenNode Device Reset\n");
