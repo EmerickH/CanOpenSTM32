@@ -210,7 +210,8 @@ CO_CANmodule_init(CO_CANmodule_t* CANmodule, void* CANptr, CO_CANrx_t rxArray[],
     if (HAL_FDCAN_ActivateNotification(((CANopenNodeSTM32*)CANptr)->CANHandle,
                                        0 | FDCAN_IT_RX_FIFO0_NEW_MESSAGE | FDCAN_IT_RX_FIFO1_NEW_MESSAGE
                                            | FDCAN_IT_RX_FIFO0_MESSAGE_LOST | FDCAN_IT_RX_FIFO1_MESSAGE_LOST
-                                           | FDCAN_IT_TX_COMPLETE | FDCAN_IT_TX_FIFO_EMPTY | FDCAN_IT_BUS_OFF
+                                           | FDCAN_IT_TX_COMPLETE | FDCAN_IT_TX_ABORT_COMPLETE
+                                           | FDCAN_IT_TX_FIFO_EMPTY | FDCAN_IT_BUS_OFF
                                            | FDCAN_IT_ARB_PROTOCOL_ERROR | FDCAN_IT_DATA_PROTOCOL_ERROR
                                            | FDCAN_IT_ERROR_PASSIVE | FDCAN_IT_ERROR_WARNING,
                                        BUFFERE_INDEXES)
@@ -221,7 +222,8 @@ CO_CANmodule_init(CO_CANmodule_t* CANmodule, void* CANptr, CO_CANrx_t rxArray[],
     if (HAL_FDCAN_ActivateNotification(((CANopenNodeSTM32*)CANptr)->CANHandle2,
                                        0 | FDCAN_IT_RX_FIFO0_NEW_MESSAGE | FDCAN_IT_RX_FIFO1_NEW_MESSAGE
                                            | FDCAN_IT_RX_FIFO0_MESSAGE_LOST | FDCAN_IT_RX_FIFO1_MESSAGE_LOST
-                                           | FDCAN_IT_TX_COMPLETE | FDCAN_IT_TX_FIFO_EMPTY | FDCAN_IT_BUS_OFF
+                                           | FDCAN_IT_TX_COMPLETE | FDCAN_IT_TX_ABORT_COMPLETE
+                                           | FDCAN_IT_TX_FIFO_EMPTY | FDCAN_IT_BUS_OFF
                                            | FDCAN_IT_ARB_PROTOCOL_ERROR | FDCAN_IT_DATA_PROTOCOL_ERROR
                                            | FDCAN_IT_ERROR_PASSIVE | FDCAN_IT_ERROR_WARNING,
                                        BUFFERE_INDEXES)
@@ -385,6 +387,39 @@ prv_route_send(CO_CANmodule_t* CANmodule, const CO_CANtx_t* buffer, uint8_t phys
     return pending;
 }
 
+/*
+ * Sends the frames of the queue still to be sent on the phys of the mask, in the order of the buffers. A phy whose
+ * TX FIFO is full gets nothing more in this call, so that a later buffer doesn't overtake an earlier one on it.
+ * CANtxCount is counted again: a lost interrupt can't leave it wrong. Must be called with CO_LOCK_CAN_SEND.
+ * (protronic/CanOpenSTM32#1, for two phys)
+ */
+static void
+prv_flush_tx_queue(CO_CANmodule_t* CANmodule, uint8_t phys) {
+    uint16_t count = 0U;
+    CO_CANtx_t* buffer = &CANmodule->txArray[0];
+    for (uint16_t i = CANmodule->txSize; i > 0U; i--, buffer++) {
+        if (!buffer->bufferFull) {
+            continue;
+        }
+        uint8_t mask = buffer->phyPending & phys;
+        if (mask != 0U) {
+            bool sent = false;
+            uint8_t again = prv_route_send(CANmodule, buffer, mask, &sent);
+            if (sent) {
+                CANmodule->bufferInhibitFlag = buffer->syncFlag;
+            }
+            buffer->phyPending = (uint8_t)((buffer->phyPending & ~mask) | again);
+            phys &= (uint8_t)~again; /* its TX FIFO is full */
+        }
+        if (buffer->phyPending == 0U) {
+            buffer->bufferFull = false;
+        } else {
+            count++;
+        }
+    }
+    CANmodule->CANtxCount = count;
+}
+
 /* A phy went down: abort what it has in its TX FIFO and forget the frames still to be sent on it */
 static void
 prv_phy_down(CO_CANmodule_t* CANmodule, uint8_t phy) {
@@ -497,6 +532,33 @@ prv_send_can_message(CO_CANmodule_t* CANmodule, CO_CANtx_t* buffer) {
 #endif
     return success;
 }
+
+/*
+ * Sends the frames of the queue, in the order of the buffers, until the hardware is full. A buffer is free once
+ * given to the hardware. CANtxCount is counted again: a lost interrupt can't leave it wrong. Must be called with
+ * CO_LOCK_CAN_SEND. (protronic/CanOpenSTM32#1)
+ */
+static void
+prv_flush_tx_queue(CO_CANmodule_t* CANmodule) {
+    uint16_t pending = 0U;
+    bool_t hwFull = false;
+    CO_CANtx_t* buffer = &CANmodule->txArray[0];
+    for (uint16_t i = CANmodule->txSize; i > 0U; --i, ++buffer) {
+        if (!buffer->bufferFull) {
+            continue;
+        }
+        if (!hwFull) {
+            if (prv_send_can_message(CANmodule, buffer)) {
+                buffer->bufferFull = false;
+                CANmodule->bufferInhibitFlag = buffer->syncFlag;
+                continue;
+            }
+            hwFull = true; /* the next ones wait */
+        }
+        pending++;
+    }
+    CANmodule->CANtxCount = pending;
+}
 #endif
 
 /******************************************************************************/
@@ -521,23 +583,16 @@ CO_CANsend(CO_CANmodule_t* CANmodule, CO_CANtx_t* buffer) {
     CO_LOCK_CAN_SEND(CANmodule);
 #if CO_STM32_PHY_COUNT > 1
     {
-        bool sent = false;
-        bool wasFull = buffer->bufferFull;
-        /* The phys that could not take the frame keep it pending (bufferFull = something pending) */
-        uint8_t pending = prv_route_send(CANmodule, buffer, (1U << CO_STM32_PHY_COUNT) - 1U, &sent);
-        if (sent) {
-            CANmodule->bufferInhibitFlag = buffer->syncFlag;
-        }
-        buffer->phyPending = pending;
-        buffer->bufferFull = pending != 0U;
-        if (pending != 0U && !wasFull) {
-            CANmodule->CANtxCount++;
-        } else if (pending == 0U && wasFull) {
-            CANmodule->CANtxCount--;
-        }
+        /* Queued for every phy and sent through the queue: on a phy with frames waiting, the frame doesn't overtake
+         * them. The phys it isn't for, or that are down, drop it at once (prv_route_send). */
+        buffer->phyPending = (uint8_t)((1U << CO_STM32_PHY_COUNT) - 1U);
+        buffer->bufferFull = true;
+        prv_flush_tx_queue(CANmodule, buffer->phyPending);
     }
 #else
-    if (prv_send_can_message(CANmodule, buffer)) {
+    /* Straight to the hardware only when nothing waits: it would overtake the frames of the queue
+     * (protronic/CanOpenSTM32#1) */
+    if (CANmodule->CANtxCount == 0U && prv_send_can_message(CANmodule, buffer)) {
         CANmodule->bufferInhibitFlag = buffer->syncFlag;
     } else {
         /* Only increment count if buffer wasn't already full */
@@ -545,12 +600,32 @@ CO_CANsend(CO_CANmodule_t* CANmodule, CO_CANtx_t* buffer) {
             buffer->bufferFull = true;
             CANmodule->CANtxCount++;
         }
+        /* Behind the frames waiting, at once if the hardware has room */
+        prv_flush_tx_queue(CANmodule);
     }
 #endif
     CO_UNLOCK_CAN_SEND(CANmodule);
 
     return err;
 }
+
+#ifdef CO_STM32_FDCAN_Driver
+/*
+ * Bus off: the FDCAN sets CCCR.INIT and stays off the bus until the software clears it. Started again, it rejoins
+ * the bus after 129 times 11 recessive bits; the frames of its TX FIFO are lost, the queue is sent again
+ * (prv_flush_tx_queue). Only while INIT is set: a recovery under way (PSR.BO still set) is not started over. A stop
+ * of the application (HAL state not busy) is left alone. (protronic/CanOpenSTM32#1)
+ */
+static void
+prv_busoff_recover(FDCAN_HandleTypeDef* hfdcan) {
+    if ((hfdcan->Instance->PSR & FDCAN_PSR_BO) != 0U && (hfdcan->Instance->CCCR & FDCAN_CCCR_INIT) != 0U
+        && hfdcan->State == HAL_FDCAN_STATE_BUSY) {
+        if (HAL_FDCAN_Stop(hfdcan) == HAL_OK) {
+            (void)HAL_FDCAN_Start(hfdcan);
+        }
+    }
+}
+#endif
 
 /******************************************************************************/
 void
@@ -601,6 +676,7 @@ CO_CANmodule_process(CO_CANmodule_t* CANmodule) {
     uint32_t now = HAL_GetTick();
 
     for (uint8_t p = 0; p < CO_STM32_PHY_COUNT; p++) {
+        prv_busoff_recover(prv_phy_handle(CANmodule, p));
         /* signed difference: a frame may be stamped by an interrupt after "now" was read */
         if (CANmodule->up[p] && (int32_t)(now - CANmodule->lastRxMs[p]) >= (int32_t)CO_CANPHY_UP_MS) {
             prv_phy_down(CANmodule, p);
@@ -634,6 +710,14 @@ CO_CANmodule_process(CO_CANmodule_t* CANmodule) {
             }
         }
         CANmodule->CANerrorStatus = status;
+    }
+
+    /* The queue is sent from the transmit complete interrupt, which may not come (an abort, a lost interrupt): it is
+     * started again here, else it would wait until a reset (protronic/CanOpenSTM32#1) */
+    if (CANmodule->CANnormal && CANmodule->CANtxCount > 0U) {
+        CO_LOCK_CAN_SEND(CANmodule);
+        prv_flush_tx_queue(CANmodule, (uint8_t)((1U << CO_STM32_PHY_COUNT) - 1U));
+        CO_UNLOCK_CAN_SEND(CANmodule);
     }
 }
 
@@ -677,6 +761,7 @@ CO_CANmodule_process(CO_CANmodule_t* CANmodule) {
 
 #ifdef CO_STM32_FDCAN_Driver
 
+    prv_busoff_recover(((CANopenNodeSTM32*)CANmodule->CANptr)->CANHandle);
     err = ((FDCAN_HandleTypeDef*)((CANopenNodeSTM32*)CANmodule->CANptr)->CANHandle)->Instance->PSR
           & (FDCAN_PSR_BO | FDCAN_PSR_EW | FDCAN_PSR_EP);
 
@@ -688,7 +773,6 @@ CO_CANmodule_process(CO_CANmodule_t* CANmodule) {
 
         if (err & FDCAN_PSR_BO) {
             status |= CO_CAN_ERRTX_BUS_OFF;
-            // In this driver we expect that the controller is automatically handling the protocol exceptions.
 
         } else {
             /* recalculate CANerrorStatus, first clear some flags */
@@ -721,7 +805,12 @@ CO_CANmodule_process(CO_CANmodule_t* CANmodule) {
 
         if (err & CAN_ESR_BOFF) {
             status |= CO_CAN_ERRTX_BUS_OFF;
-            // In this driver, we assume that auto bus recovery is activated ! so this error will eventually handled automatically.
+            /* With automatic bus-off management the bxCAN recovers by itself, else it is started again
+             * (protronic/CanOpenSTM32#1) */
+            CAN_HandleTypeDef* hcan = ((CANopenNodeSTM32*)CANmodule->CANptr)->CANHandle;
+            if (hcan->Init.AutoBusOff == DISABLE && HAL_CAN_Stop(hcan) == HAL_OK) {
+                (void)HAL_CAN_Start(hcan);
+            }
 
         } else {
             /* recalculate CANerrorStatus, first clear some flags */
@@ -742,6 +831,14 @@ CO_CANmodule_process(CO_CANmodule_t* CANmodule) {
     }
 
 #endif
+
+    /* The queue is sent from the transmit complete interrupt, which may not come (an abort, a lost interrupt): it is
+     * started again here, else it would wait until a reset (protronic/CanOpenSTM32#1) */
+    if (CANmodule->CANnormal && CANmodule->CANtxCount > 0U) {
+        CO_LOCK_CAN_SEND(CANmodule);
+        prv_flush_tx_queue(CANmodule);
+        CO_UNLOCK_CAN_SEND(CANmodule);
+    }
 }
 #endif
 
@@ -768,8 +865,7 @@ prv_read_can_received_msg(CAN_HandleTypeDef* hcan, uint32_t fifo, uint32_t fifo_
     uint8_t messageFound = 0;
 
 #ifdef CO_STM32_FDCAN_Driver
-    /* static: safe because the interrupts of both FDCAN have the same priority (5), they don't preempt each other */
-    static FDCAN_RxHeaderTypeDef rx_hdr;
+    FDCAN_RxHeaderTypeDef rx_hdr;
     /* Read received message from FIFO */
     if (HAL_FDCAN_GetRxMessage(hfdcan, fifo, &rx_hdr, rcvMsg.data) != HAL_OK) {
         return;
@@ -827,7 +923,7 @@ prv_read_can_received_msg(CAN_HandleTypeDef* hcan, uint32_t fifo, uint32_t fifo_
     }
 #endif
 #else
-    static CAN_RxHeaderTypeDef rx_hdr;
+    CAN_RxHeaderTypeDef rx_hdr;
     /* Read received message from FIFO */
     if (HAL_CAN_GetRxMessage(hcan, fifo, &rx_hdr, rcvMsg.data) != HAL_OK) {
         return;
@@ -864,6 +960,34 @@ prv_read_can_received_msg(CAN_HandleTypeDef* hcan, uint32_t fifo, uint32_t fifo_
     }
 }
 
+/**
+ * \brief           Read every message waiting in an RX FIFO
+ *
+ * From protronic/CanOpenSTM32#1 and #104: the FDCAN "new message" interrupt is an event per
+ * message, not a level that follows the fill level of the FIFO. Read one message per interrupt, a FIFO that
+ * once held two messages at an interrupt (the interrupt came late: interrupts masked, a debugger halt) keeps
+ * one forever: each new message then reads out an older one. The node answers late and, its free FIFO
+ * smaller, loses the frames of a burst (an SDO block) until it is reset. Reading the FIFO empty removes it.
+ * On bxCAN the interrupt follows the fill level: the loop only saves entering it again for each message.
+ */
+#define CO_RX_FIFO_DRAIN_MAX 64U /* the largest FIFO of the FDCAN (H7) */
+#ifdef CO_STM32_FDCAN_Driver
+static void
+prv_drain_rx_fifo(FDCAN_HandleTypeDef* hfdcan, uint32_t fifo, uint32_t fifo_isrs) {
+    /* Bounded: a read that fails (it doesn't, the FIFO isn't empty) must not hold the interrupt forever */
+    for (uint32_t n = 0; n < CO_RX_FIFO_DRAIN_MAX && HAL_FDCAN_GetRxFifoFillLevel(hfdcan, fifo) > 0U; n++) {
+        prv_read_can_received_msg(hfdcan, fifo, fifo_isrs);
+    }
+}
+#else
+static void
+prv_drain_rx_fifo(CAN_HandleTypeDef* hcan, uint32_t fifo, uint32_t fifo_isrs) {
+    for (uint32_t n = 0; n < CO_RX_FIFO_DRAIN_MAX && HAL_CAN_GetRxFifoFillLevel(hcan, fifo) > 0U; n++) {
+        prv_read_can_received_msg(hcan, fifo, fifo_isrs);
+    }
+}
+#endif
+
 #ifdef CO_STM32_FDCAN_Driver
 /**
  * \brief           Rx FIFO 0 callback.
@@ -879,8 +1003,9 @@ HAL_FDCAN_RxFifo0Callback(FDCAN_HandleTypeDef* hfdcan, uint32_t RxFifo0ITs) {
         CANModule_local->lost[prv_phy_of(CANModule_local, hfdcan)]++;
 #endif
     }
-    if (RxFifo0ITs & FDCAN_IT_RX_FIFO0_NEW_MESSAGE) {
-        prv_read_can_received_msg(hfdcan, FDCAN_RX_FIFO0, RxFifo0ITs);
+    /* The whole FIFO is read (prv_drain_rx_fifo), also after a loss */
+    if (RxFifo0ITs & (FDCAN_IT_RX_FIFO0_NEW_MESSAGE | FDCAN_IT_RX_FIFO0_MESSAGE_LOST)) {
+        prv_drain_rx_fifo(hfdcan, FDCAN_RX_FIFO0, RxFifo0ITs);
     }
 }
 
@@ -898,8 +1023,8 @@ HAL_FDCAN_RxFifo1Callback(FDCAN_HandleTypeDef* hfdcan, uint32_t RxFifo1ITs) {
         CANModule_local->lost[prv_phy_of(CANModule_local, hfdcan)]++;
 #endif
     }
-    if (RxFifo1ITs & FDCAN_IT_RX_FIFO1_NEW_MESSAGE) {
-        prv_read_can_received_msg(hfdcan, FDCAN_RX_FIFO1, RxFifo1ITs);
+    if (RxFifo1ITs & (FDCAN_IT_RX_FIFO1_NEW_MESSAGE | FDCAN_IT_RX_FIFO1_MESSAGE_LOST)) {
+        prv_drain_rx_fifo(hfdcan, FDCAN_RX_FIFO1, RxFifo1ITs);
     }
 }
 
@@ -914,8 +1039,6 @@ HAL_FDCAN_TxBufferCompleteCallback(FDCAN_HandleTypeDef* hfdcan, uint32_t BufferI
     CANModule_local->firstCANtxMessage = false;            /* First CAN message (bootup) was sent successfully */
     CANModule_local->bufferInhibitFlag = false;            /* Clear flag from previous message */
     if (CANModule_local->CANtxCount > 0U) {                /* Are there any new messages waiting to be send */
-        CO_CANtx_t* buffer = &CANModule_local->txArray[0]; /* Start with first buffer handle */
-        uint16_t i;
 
         /*
          * Try to send more buffers, process all empty ones
@@ -927,38 +1050,32 @@ HAL_FDCAN_TxBufferCompleteCallback(FDCAN_HandleTypeDef* hfdcan, uint32_t BufferI
          */
         CO_LOCK_CAN_SEND(CANModule_local);
 #if CO_STM32_PHY_COUNT > 1
-        /* This callback is for one phy: retry only the buffers still pending on it */
-        const uint8_t bit = (uint8_t)(1U << prv_phy_of(CANModule_local, hfdcan));
-        for (i = CANModule_local->txSize; i > 0U; --i, ++buffer) {
-            if (buffer->bufferFull && (buffer->phyPending & bit)) {
-                bool sent = false;
-                uint8_t again = prv_route_send(CANModule_local, buffer, bit, &sent);
-                if (sent) {
-                    CANModule_local->bufferInhibitFlag = buffer->syncFlag;
-                }
-                buffer->phyPending = (uint8_t)((buffer->phyPending & ~bit) | again);
-                if (buffer->phyPending == 0U) {
-                    buffer->bufferFull = false;
-                    CANModule_local->CANtxCount--;
-                }
-                if (again) {
-                    break; /* the TX FIFO of this phy is full */
-                }
-            }
-        }
+        /* This callback is for one phy: only the buffers still pending on it */
+        prv_flush_tx_queue(CANModule_local, (uint8_t)(1U << prv_phy_of(CANModule_local, hfdcan)));
 #else
-        for (i = CANModule_local->txSize; i > 0U; --i, ++buffer) {
-            /* Try to send message */
-            if (buffer->bufferFull) {
-                if (prv_send_can_message(CANModule_local, buffer)) {
-                    buffer->bufferFull = false;
-                    CANModule_local->CANtxCount--;
-                    CANModule_local->bufferInhibitFlag = buffer->syncFlag;
-                } else {
-                    break;  // if we could not send the message, break out of the loop (the tx buffers are full)
-                }
-            }
-        }
+        prv_flush_tx_queue(CANModule_local);
+#endif
+        CO_UNLOCK_CAN_SEND(CANModule_local);
+    }
+}
+
+/**
+ * \brief           A transmission was aborted (bus off, prv_phy_down())
+ *
+ * The frame is lost, but the queue must go on: no transmit complete interrupt would send it.
+ * (protronic/CanOpenSTM32#1)
+ */
+void
+HAL_FDCAN_TxBufferAbortCallback(FDCAN_HandleTypeDef* hfdcan, uint32_t BufferIndexes) {
+    (void)BufferIndexes;
+    CANModule_local->bufferInhibitFlag = false;
+    if (CANModule_local->CANtxCount > 0U) {
+        CO_LOCK_CAN_SEND(CANModule_local);
+#if CO_STM32_PHY_COUNT > 1
+        prv_flush_tx_queue(CANModule_local, (uint8_t)(1U << prv_phy_of(CANModule_local, hfdcan)));
+#else
+        (void)hfdcan;
+        prv_flush_tx_queue(CANModule_local);
 #endif
         CO_UNLOCK_CAN_SEND(CANModule_local);
     }
@@ -971,7 +1088,7 @@ HAL_FDCAN_TxBufferCompleteCallback(FDCAN_HandleTypeDef* hfdcan, uint32_t BufferI
  */
 void
 HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef* hcan) {
-    prv_read_can_received_msg(hcan, CAN_RX_FIFO0, 0);
+    prv_drain_rx_fifo(hcan, CAN_RX_FIFO0, 0);
 }
 
 /**
@@ -981,7 +1098,7 @@ HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef* hcan) {
  */
 void
 HAL_CAN_RxFifo1MsgPendingCallback(CAN_HandleTypeDef* hcan) {
-    prv_read_can_received_msg(hcan, CAN_RX_FIFO1, 0);
+    prv_drain_rx_fifo(hcan, CAN_RX_FIFO1, 0);
 }
 
 /**
@@ -996,8 +1113,6 @@ CO_CANinterrupt_TX(CO_CANmodule_t* CANmodule, uint32_t MailboxNumber) {
     CANmodule->firstCANtxMessage = false;            /* First CAN message (bootup) was sent successfully */
     CANmodule->bufferInhibitFlag = false;            /* Clear flag from previous message */
     if (CANmodule->CANtxCount > 0U) {                /* Are there any new messages waiting to be send */
-        CO_CANtx_t* buffer = &CANmodule->txArray[0]; /* Start with first buffer handle */
-        uint16_t i;
 
         /*
 		 * Try to send more buffers, process all empty ones
@@ -1008,18 +1123,19 @@ CO_CANinterrupt_TX(CO_CANmodule_t* CANmodule, uint32_t MailboxNumber) {
 		 *  then no need to lock interrupts..)
 		 */
         CO_LOCK_CAN_SEND(CANmodule);
-        for (i = CANmodule->txSize; i > 0U; --i, ++buffer) {
-            /* Try to send message */
-            if (buffer->bufferFull) {
-                if (prv_send_can_message(CANmodule, buffer)) {
-                    buffer->bufferFull = false;
-                    CANmodule->CANtxCount--;
-                    CANmodule->bufferInhibitFlag = buffer->syncFlag;
-                }
-                else
-                    break;  // if we could not send the message, break out of the loop (the tx buffers are full)
-            }
-        }
+        prv_flush_tx_queue(CANmodule);
+        CO_UNLOCK_CAN_SEND(CANmodule);
+    }
+}
+
+/* A mailbox was aborted (bus off, or a lost arbitration or an error without automatic retransmission): the frame is
+ * lost, the queue goes on (protronic/CanOpenSTM32#1) */
+static void
+prv_tx_aborted(CO_CANmodule_t* CANmodule) {
+    CANmodule->bufferInhibitFlag = false;
+    if (CANmodule->CANtxCount > 0U) {
+        CO_LOCK_CAN_SEND(CANmodule);
+        prv_flush_tx_queue(CANmodule);
         CO_UNLOCK_CAN_SEND(CANmodule);
     }
 }
@@ -1031,11 +1147,26 @@ HAL_CAN_TxMailbox0CompleteCallback(CAN_HandleTypeDef* hcan) {
 
 void
 HAL_CAN_TxMailbox1CompleteCallback(CAN_HandleTypeDef* hcan) {
-    CO_CANinterrupt_TX(CANModule_local, CAN_TX_MAILBOX0);
+    CO_CANinterrupt_TX(CANModule_local, CAN_TX_MAILBOX1);
 }
 
 void
 HAL_CAN_TxMailbox2CompleteCallback(CAN_HandleTypeDef* hcan) {
-    CO_CANinterrupt_TX(CANModule_local, CAN_TX_MAILBOX0);
+    CO_CANinterrupt_TX(CANModule_local, CAN_TX_MAILBOX2);
+}
+
+void
+HAL_CAN_TxMailbox0AbortCallback(CAN_HandleTypeDef* hcan) {
+    prv_tx_aborted(CANModule_local);
+}
+
+void
+HAL_CAN_TxMailbox1AbortCallback(CAN_HandleTypeDef* hcan) {
+    prv_tx_aborted(CANModule_local);
+}
+
+void
+HAL_CAN_TxMailbox2AbortCallback(CAN_HandleTypeDef* hcan) {
+    prv_tx_aborted(CANModule_local);
 }
 #endif
