@@ -136,6 +136,10 @@ typedef struct {
     volatile bool_t up[CO_STM32_PHY_COUNT];       /* a frame was received in the last CO_CANPHY_UP_MS */
     volatile uint32_t lost[CO_STM32_PHY_COUNT];   /* receive FIFO overruns */
     volatile uint32_t dropped[CO_STM32_PHY_COUNT]; /* frames routed to a phy that was down */
+    /* frames received (all, before the id filter) and queued for sending, and their bits (CO_CANPHY_FRAME_BITS):
+     * counters that wrap */
+    volatile uint32_t rxFrames[CO_STM32_PHY_COUNT], txFrames[CO_STM32_PHY_COUNT];
+    volatile uint32_t rxBits[CO_STM32_PHY_COUNT], txBits[CO_STM32_PHY_COUNT];
 #endif
 
     /* STM32 specific features */
@@ -163,11 +167,16 @@ typedef struct {
 bool CO_CANphyRx(uint8_t phy, uint16_t* ident, const uint8_t* data, uint8_t dlc);
 bool CO_CANphyTx(uint8_t phy, uint16_t* ident, uint8_t* data, uint8_t dlc);
 
+/* Bits of a standard data frame on the bus with the interframe space, without the stuff bits (up to ~20 % more):
+ * a lower bound */
+#define CO_CANPHY_FRAME_BITS(dlc) (47U + 8U * (uint32_t)(dlc))
+
 typedef struct {
     bool up;
     uint8_t state; /* CO_CANPHY_* */
     uint8_t tec, rec;
     uint32_t lost, dropped;
+    uint32_t rxFrames, txFrames, rxBits, txBits;
 } CO_CANphyStatus_t;
 
 void CO_CANphyGetStatus(CO_CANmodule_t* CANmodule, uint8_t phy, CO_CANphyStatus_t* status);

@@ -126,6 +126,10 @@ CO_CANmodule_init(CO_CANmodule_t* CANmodule, void* CANptr, CO_CANrx_t rxArray[],
         CANmodule->up[p] = false;
         CANmodule->lost[p] = 0U;
         CANmodule->dropped[p] = 0U;
+        CANmodule->rxFrames[p] = 0U;
+        CANmodule->txFrames[p] = 0U;
+        CANmodule->rxBits[p] = 0U;
+        CANmodule->txBits[p] = 0U;
     }
 #endif
 
@@ -372,6 +376,8 @@ prv_route_send(CO_CANmodule_t* CANmodule, const CO_CANtx_t* buffer, uint8_t phys
         }
         if (prv_send_frame(prv_phy_handle(CANmodule, p), (buffer->ident & FLAG_RTR) | ident, buffer->DLC, data)) {
             *sent = true;
+            CANmodule->txFrames[p]++;
+            CANmodule->txBits[p] += CO_CANPHY_FRAME_BITS(buffer->DLC);
         } else {
             pending |= (uint8_t)(1U << p);
         }
@@ -656,6 +662,10 @@ CO_CANphyGetStatus(CO_CANmodule_t* CANmodule, uint8_t phy, CO_CANphyStatus_t* st
     status->rec = (uint8_t)((ecr >> 8) & 0x7FU);
     status->lost = CANmodule->lost[phy];
     status->dropped = CANmodule->dropped[phy];
+    status->rxFrames = CANmodule->rxFrames[phy];
+    status->txFrames = CANmodule->txFrames[phy];
+    status->rxBits = CANmodule->rxBits[phy];
+    status->txBits = CANmodule->txBits[phy];
 }
 #else
 void
@@ -805,6 +815,8 @@ prv_read_can_received_msg(CAN_HandleTypeDef* hcan, uint32_t fifo, uint32_t fifo_
         /* Any frame, even one that is dropped below, shows the bus is alive */
         CANModule_local->lastRxMs[phy] = HAL_GetTick();
         CANModule_local->up[phy] = true;
+        CANModule_local->rxFrames[phy]++;
+        CANModule_local->rxBits[phy] += CO_CANPHY_FRAME_BITS(rcvMsg.dlc);
 
         uint16_t ident = (uint16_t)(rcvMsg.ident & CANID_MASK);
         if (!CO_CANphyRx(phy, &ident, rcvMsg.data, rcvMsg.dlc)) {
