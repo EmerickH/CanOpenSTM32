@@ -175,6 +175,9 @@ typedef struct {
         rxNew = NULL;                                                                                                  \
     } while (0)
 
+/* Received frames lost because the receive FIFO of the FDCAN was full (its interrupt
+ * came too late). A lower bound: frames lost between two interrupts count once. */
+extern volatile uint32_t CO_CANrxLostFrames;
 
 #ifdef __cplusplus
 }

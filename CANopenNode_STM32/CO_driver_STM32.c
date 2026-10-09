@@ -33,6 +33,7 @@
 
 /* Local CAN module object */
 static CO_CANmodule_t* CANModule_local = NULL; /* Local instance of global CAN module */
+volatile uint32_t CO_CANrxLostFrames = 0;       /* See CO_driver_target.h */
 
 /* CAN masks for identifiers */
 #define CANID_MASK 0x07FF /*!< CAN standard ID mask */
@@ -167,6 +168,7 @@ CO_CANmodule_init(CO_CANmodule_t* CANmodule, void* CANptr, CO_CANrx_t rxArray[],
 #ifdef CO_STM32_FDCAN_Driver
     if (HAL_FDCAN_ActivateNotification(((CANopenNodeSTM32*)CANptr)->CANHandle,
                                        0 | FDCAN_IT_RX_FIFO0_NEW_MESSAGE | FDCAN_IT_RX_FIFO1_NEW_MESSAGE
+                                           | FDCAN_IT_RX_FIFO0_MESSAGE_LOST | FDCAN_IT_RX_FIFO1_MESSAGE_LOST
                                            | FDCAN_IT_TX_COMPLETE | FDCAN_IT_TX_FIFO_EMPTY | FDCAN_IT_BUS_OFF
                                            | FDCAN_IT_ARB_PROTOCOL_ERROR | FDCAN_IT_DATA_PROTOCOL_ERROR
                                            | FDCAN_IT_ERROR_PASSIVE | FDCAN_IT_ERROR_WARNING,
@@ -598,6 +600,9 @@ prv_read_can_received_msg(CAN_HandleTypeDef* hcan, uint32_t fifo, uint32_t fifo_
  */
 void
 HAL_FDCAN_RxFifo0Callback(FDCAN_HandleTypeDef* hfdcan, uint32_t RxFifo0ITs) {
+    if (RxFifo0ITs & FDCAN_IT_RX_FIFO0_MESSAGE_LOST) {
+        CO_CANrxLostFrames++;
+    }
     if (RxFifo0ITs & FDCAN_IT_RX_FIFO0_NEW_MESSAGE) {
         prv_read_can_received_msg(hfdcan, FDCAN_RX_FIFO0, RxFifo0ITs);
     }
@@ -611,6 +616,9 @@ HAL_FDCAN_RxFifo0Callback(FDCAN_HandleTypeDef* hfdcan, uint32_t RxFifo0ITs) {
  */
 void
 HAL_FDCAN_RxFifo1Callback(FDCAN_HandleTypeDef* hfdcan, uint32_t RxFifo1ITs) {
+    if (RxFifo1ITs & FDCAN_IT_RX_FIFO1_MESSAGE_LOST) {
+        CO_CANrxLostFrames++;
+    }
     if (RxFifo1ITs & FDCAN_IT_RX_FIFO1_NEW_MESSAGE) {
         prv_read_can_received_msg(hfdcan, FDCAN_RX_FIFO1, RxFifo1ITs);
     }
