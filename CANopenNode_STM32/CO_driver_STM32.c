@@ -42,13 +42,18 @@ volatile uint32_t CO_CANrxLostFrames = 0;       /* See CO_driver_target.h */
 #define CANID_MASK 0x07FF /*!< CAN standard ID mask */
 #define FLAG_RTR   0x8000 /*!< RTR flag, part of identifier */
 
-#ifndef BUFFERE_INDEXES
-#ifdef STM32H5xx_HAL_CONF_H
-#define BUFFERE_INDEXES FDCAN_TX_BUFFER0 | FDCAN_TX_BUFFER1 | FDCAN_TX_BUFFER2
+#ifdef CO_STM32_FDCAN_Driver
+#ifndef FDCAN_BUFFER_INDEXES
+#if defined(FDCAN_TX_BUFFER31)
+#define FDCAN_BUFFER_INDEXES 0xFFFFFFFFU
+#elif defined(FDCAN_TX_BUFFER2)
+#define FDCAN_BUFFER_INDEXES FDCAN_TX_BUFFER0 | FDCAN_TX_BUFFER1 | FDCAN_TX_BUFFER2
 #else
-#define BUFFERE_INDEXES 0xFFFFFFFF
+#define FDCAN_BUFFER_INDEXES 0xFFFFFFFFU
+#warning "FDCAN_BUFFER_INDEXES not defined"
 #endif
 #endif
+#endif /* CO_STM32_FDCAN_Driver */
 
 /******************************************************************************/
 void
@@ -150,9 +155,13 @@ CO_CANmodule_init(CO_CANmodule_t* CANmodule, void* CANptr, CO_CANrx_t rxArray[],
     /***************************************/
     /* STM32 related configuration */
     /***************************************/
-    ((CANopenNodeSTM32*)CANptr)->HWInitFunction();
+    if (((CANopenNodeSTM32*)CANptr)->HWInitFunction != NULL) {
+        ((CANopenNodeSTM32*)CANptr)->HWInitFunction();
+    }
 #if CO_STM32_PHY_COUNT > 1
-    ((CANopenNodeSTM32*)CANptr)->HWInitFunction2();
+    if (((CANopenNodeSTM32*)CANptr)->HWInitFunction2 != NULL) {
+        ((CANopenNodeSTM32*)CANptr)->HWInitFunction2();
+    }
 #endif
 
     /*
@@ -214,7 +223,7 @@ CO_CANmodule_init(CO_CANmodule_t* CANmodule, void* CANptr, CO_CANrx_t rxArray[],
                                            | FDCAN_IT_TX_FIFO_EMPTY | FDCAN_IT_BUS_OFF
                                            | FDCAN_IT_ARB_PROTOCOL_ERROR | FDCAN_IT_DATA_PROTOCOL_ERROR
                                            | FDCAN_IT_ERROR_PASSIVE | FDCAN_IT_ERROR_WARNING,
-                                       BUFFERE_INDEXES)
+                                       FDCAN_BUFFER_INDEXES)
         != HAL_OK) {
         return CO_ERROR_ILLEGAL_ARGUMENT;
     }
@@ -226,7 +235,7 @@ CO_CANmodule_init(CO_CANmodule_t* CANmodule, void* CANptr, CO_CANrx_t rxArray[],
                                            | FDCAN_IT_TX_FIFO_EMPTY | FDCAN_IT_BUS_OFF
                                            | FDCAN_IT_ARB_PROTOCOL_ERROR | FDCAN_IT_DATA_PROTOCOL_ERROR
                                            | FDCAN_IT_ERROR_PASSIVE | FDCAN_IT_ERROR_WARNING,
-                                       BUFFERE_INDEXES)
+                                       FDCAN_BUFFER_INDEXES)
         != HAL_OK) {
         return CO_ERROR_ILLEGAL_ARGUMENT;
     }
@@ -425,18 +434,16 @@ static void
 prv_phy_down(CO_CANmodule_t* CANmodule, uint8_t phy) {
     CO_LOCK_CAN_SEND(CANmodule);
     /* a frame may have come in since the caller checked */
-    if ((int32_t)(HAL_GetTick() - CANmodule->lastRxMs[phy]) < (int32_t)CO_CANPHY_UP_MS) {
-        CO_UNLOCK_CAN_SEND(CANmodule);
-        return;
-    }
-    CANmodule->up[phy] = false;
-    HAL_FDCAN_AbortTxRequest(prv_phy_handle(CANmodule, phy), BUFFERE_INDEXES);
-    CO_CANtx_t* buffer = &CANmodule->txArray[0];
-    for (uint16_t i = CANmodule->txSize; i > 0U; i--, buffer++) {
-        buffer->phyPending &= (uint8_t)~(1U << phy);
-        if (buffer->bufferFull && buffer->phyPending == 0U) {
-            buffer->bufferFull = false;
-            CANmodule->CANtxCount--;
+    if ((int32_t)(HAL_GetTick() - CANmodule->lastRxMs[phy]) >= (int32_t)CO_CANPHY_UP_MS) {
+        CANmodule->up[phy] = false;
+        HAL_FDCAN_AbortTxRequest(prv_phy_handle(CANmodule, phy), FDCAN_BUFFER_INDEXES);
+        CO_CANtx_t* buffer = &CANmodule->txArray[0];
+        for (uint16_t i = CANmodule->txSize; i > 0U; i--, buffer++) {
+            buffer->phyPending &= (uint8_t)~(1U << phy);
+            if (buffer->bufferFull && buffer->phyPending == 0U) {
+                buffer->bufferFull = false;
+                CANmodule->CANtxCount--;
+            }
         }
     }
     CO_UNLOCK_CAN_SEND(CANmodule);
@@ -787,6 +794,11 @@ CO_CANmodule_process(CO_CANmodule_t* CANmodule) {
             if (err & FDCAN_PSR_EP) {
                 status |= CO_CAN_ERRRX_PASSIVE | CO_CAN_ERRTX_PASSIVE;
             }
+
+            /* If the transmitter is not passive, clear also the (non-latching) TX overflow */
+            if ((status & CO_CAN_ERRTX_PASSIVE) == 0U) {
+                status &= 0xFFFFU ^ CO_CAN_ERRTX_OVERFLOW;
+            }
         }
 
         CANmodule->CANerrorStatus = status;
@@ -824,6 +836,11 @@ CO_CANmodule_process(CO_CANmodule_t* CANmodule) {
 
             if (err & CAN_ESR_EPVF) {
                 status |= CO_CAN_ERRRX_PASSIVE | CO_CAN_ERRTX_PASSIVE;
+            }
+
+            /* If the transmitter is not passive, clear also the (non-latching) TX overflow */
+            if ((status & CO_CAN_ERRTX_PASSIVE) == 0U) {
+                status &= 0xFFFFU ^ CO_CAN_ERRTX_OVERFLOW;
             }
         }
 
@@ -866,8 +883,11 @@ prv_read_can_received_msg(CAN_HandleTypeDef* hcan, uint32_t fifo, uint32_t fifo_
 
 #ifdef CO_STM32_FDCAN_Driver
     FDCAN_RxHeaderTypeDef rx_hdr;
+    /* Written to a buffer of the size of the largest FD frame, so that a node that does not comply with the
+     * classic CAN format and sends a longer frame cannot overflow the 8 bytes of the message */
+    uint8_t rx_data[64];
     /* Read received message from FIFO */
-    if (HAL_FDCAN_GetRxMessage(hfdcan, fifo, &rx_hdr, rcvMsg.data) != HAL_OK) {
+    if (HAL_FDCAN_GetRxMessage(hfdcan, fifo, &rx_hdr, rx_data) != HAL_OK) {
         return;
     }
     /* Setup identifier (with RTR) and length */
@@ -903,6 +923,9 @@ prv_read_can_received_msg(CAN_HandleTypeDef* hcan, uint32_t fifo, uint32_t fifo_
         default:
             rcvMsg.dlc = 0;
             break; /* Invalid length when more than 8 */
+    }
+    if (rcvMsg.dlc > 0) {
+        memcpy(rcvMsg.data, rx_data, rcvMsg.dlc);
     }
     rcvMsgIdent = rcvMsg.ident;
 #if CO_STM32_PHY_COUNT > 1

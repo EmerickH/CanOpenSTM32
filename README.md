@@ -4,9 +4,58 @@ CANopenSTM32 is a CANopen stack running on STM32 microcontroller based on [CANOp
 
 ## How to run demos
 
-Examples are developed in [STM32CubeIDE](https://www.st.com/en/development-tools/stm32cubeide.html) tool,
-official ST development studio for any STM32 microcontroller.
-You can directly open projects in the STM32CubeIDE and run examples on the relevant boards.
+### STM32CubeIDE - official project
+
+Examples are developed in [STM32CubeIDE](https://www.st.com/en/development-tools/stm32cubeide.html) tool, official ST development studio for any STM32 microcontroller. You can directly open projects in the STM32CubeIDE and run examples on the relevant boards.
+
+### CMake and VSCode
+
+Most of the examples also come with CMake build system and dedicated preset. Such examples can be directly opened with the VSCode (or any other software tool/terminal that can process cmake). The `.vscode` folder in each project provides:
+
+- Recommended extensions to install
+- C/C++ Intellisense configuration with CMake as a provider
+- Launch file to load/debug the application with STLink with `cortex-debug` extension
+- Tasks file with generic tasks to compile, run, list STLinks, etc
+
+Tools required and in the path:
+
+- CMake build configurator
+- Ninja build system
+- ARM GCC none eabi
+- STLink Server for programming/debugging and STM32CubeProgrammer CLI
+
+```
+# CMake
+cmake --version
+cmake version 4.3.1
+
+CMake suite maintained and supported by Kitware (kitware.com/cmake).
+
+# Ninja
+ninja --version
+1.13.2
+
+# ARM GCC
+arm-none-eabi-gcc --version
+arm-none-eabi-gcc (GNU Tools for STM32 14.3.rel1.20251027-0700) 14.3.1 20250623
+Copyright (C) 2024 Free Software Foundation, Inc.
+This is free software; see the source for copying conditions.  There is NO
+warranty; not even for MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+
+# STM32CubeProgrammer CLI
+STM32_Programmer_CLI --version
+      -------------------------------------------------------------------
+                        STM32CubeProgrammer v2.23.0                  
+      -------------------------------------------------------------------
+
+STM32CubeProgrammer version: 2.23.0 
+```
+
+> The fastest and most efficient way is to install the [STM32CubeCLT](https://www.st.com/en/development-tools/stm32cubeclt.html) package, which comes with minimum required set of tools for STM32 development with external IDE/CMake.
+
+![VS Code view](docs/vscode-screenshot.png)
+
+> VSCode preview with the syntax highlighting and intellisense provider. On the bottom we can see the CMake project detection with the correct preset.
 
 ## Repository directories
 
@@ -16,7 +65,6 @@ You can directly open projects in the STM32CubeIDE and run examples on the relev
 - `.\Legacy` : It includes an older version of CANOpenSTM32 implementation, specifically made for FDCAN controllers, however it was stable and includes the FreeRTOS implementation. 
 
 ## Supported boards and MCUs
- 
 
 ### [STM32H735G-DK](https://www.st.com/en/evaluation-tools/stm32h735g-dk.html).
 It has many features of STM32H7xx series and includes 3 CAN transceivers on the board.
@@ -42,6 +90,8 @@ You don't need any additional hardware to connect to existing CAN network.
 It also includes built-in programmer and virtual COM port for communication, hence evaluation is quick and easy.
 > CanOpen demo works at `FDCAN1` port. Use connector *CN12*.
 > FDCAN IP block is same for any STM32G0xx MCU family, hence migration to your custom board should be straight-forward.
+
+*Note*: Example is CMake ready and can be configured with CMake build generator, Ninja build system and GCC compiler.
 
 
 ### [NUCLEO-F303ZE](https://www.st.com/en/evaluation-tools/nucleo-f303ze.html) / [NUCLEO-F072RB](https://www.st.com/en/evaluation-tools/nucleo-f072rb.html) + [MAX33040ESHLD](https://www.digikey.ie/en/products/detail/analog-devices-inc-maxim-integrated/MAX33040ESHLD/13558019)

@@ -27,8 +27,8 @@
 #include "CO_app_STM32.h"
 #include "CANopen.h"
 #include "main.h"
-#include <stdio.h>
 #include <inttypes.h>
+#include <stdio.h>
 
 #include "CO_storageBlank.h"
 #include "OD.h"
@@ -47,11 +47,21 @@ CANopenNodeSTM32*
     CO_NMT_STARTUP_TO_OPERATIONAL                                                                                      \
     | CO_NMT_ERR_ON_ERR_REG | CO_ERR_REG_GENERIC_ERR | CO_ERR_REG_COMMUNICATION
 #endif
-#define FIRST_HB_TIME        500
+#ifndef FIRST_HB_TIME
+#define FIRST_HB_TIME 500
+#endif
+#ifndef SDO_SRV_TIMEOUT_TIME
 #define SDO_SRV_TIMEOUT_TIME 1000
+#endif
+#ifndef SDO_CLI_TIMEOUT_TIME
 #define SDO_CLI_TIMEOUT_TIME 500
-#define SDO_CLI_BLOCK        false
-#define OD_STATUS_BITS       NULL
+#endif
+#ifndef SDO_CLI_BLOCK
+#define SDO_CLI_BLOCK false
+#endif
+#ifndef OD_STATUS_BITS
+#define OD_STATUS_BITS NULL
+#endif
 
 /* Global variables and objects */
 CO_t* CO = NULL; /* CANopen object */
@@ -86,7 +96,7 @@ canopen_app_init(CANopenNodeSTM32* _canopenNodeSTM32) {
     CO_config_t co_config = {0};
     OD_INIT_CONFIG(co_config); /* helper macro from OD.h */
     co_config.CNT_LEDS = 1;
-#if ((CO_CONFIG_LSS)&CO_CONFIG_LSS_SLAVE) != 0
+#if ((CO_CONFIG_LSS) & CO_CONFIG_LSS_SLAVE) != 0
     co_config.CNT_LSS_SLV = 1;
 #endif
     config_ptr = &co_config;
@@ -118,8 +128,9 @@ canopen_app_init(CANopenNodeSTM32* _canopenNodeSTM32) {
     return 0;
 }
 
-__weak uint32_t canopen_app_get_time(){
-	return HAL_GetTick() * 1000;
+__weak uint32_t
+canopen_app_get_time() {
+    return HAL_GetTick() * 1000;
 }
 
 int
@@ -131,7 +142,7 @@ canopen_app_resetCommunication() {
     CO->CANmodule->CANnormal = false;
 
     /* Enter CAN configuration. */
-    CO_CANsetConfigurationMode((void*)canopenNodeSTM32);
+    CO_CANsetConfigurationMode(canopenNodeSTM32);
     CO_CANmodule_disable(CO->CANmodule);
 
     /* initialize CANopen */
@@ -141,7 +152,7 @@ canopen_app_resetCommunication() {
         return 1;
     }
 
-#if ((CO_CONFIG_LSS)&CO_CONFIG_LSS_SLAVE) != 0
+#if ((CO_CONFIG_LSS) & CO_CONFIG_LSS_SLAVE) != 0
     CO_LSS_address_t lssAddress = {.identity = {.vendorID = OD_PERSIST_COMM.x1018_identity.vendor_ID,
                                                 .productCode = OD_PERSIST_COMM.x1018_identity.productCode,
                                                 .revisionNumber = OD_PERSIST_COMM.x1018_identity.revisionNumber,
@@ -204,15 +215,16 @@ canopen_app_resetCommunication() {
         }
     }
 #endif
-#if (((CO_CONFIG_SDO_CLI) & CO_CONFIG_SDO_CLI_ENABLE) != 0) && (((CO_CONFIG_SDO_CLI) & CO_CONFIG_FLAG_CALLBACK_PRE) != 0) \
-    && defined(OD_CNT_SDO_CLI)
+#if (((CO_CONFIG_SDO_CLI) & CO_CONFIG_SDO_CLI_ENABLE) != 0)                                                            \
+    && (((CO_CONFIG_SDO_CLI) & CO_CONFIG_FLAG_CALLBACK_PRE) != 0) && defined(OD_CNT_SDO_CLI)
     if (canopenNodeSTM32->signalSDOclient != NULL) {
         for (int i = 0; i < OD_CNT_SDO_CLI; i++) {
             CO_SDOclient_initCallbackPre(&CO->SDOclient[i], &CO->SDOclient[i], canopenNodeSTM32->signalSDOclient);
         }
     }
 #endif
-#if (((CO_CONFIG_HB_CONS) & CO_CONFIG_HB_CONS_ENABLE) != 0) && (((CO_CONFIG_HB_CONS) & CO_CONFIG_FLAG_CALLBACK_PRE) != 0)
+#if (((CO_CONFIG_HB_CONS) & CO_CONFIG_HB_CONS_ENABLE) != 0)                                                            \
+    && (((CO_CONFIG_HB_CONS) & CO_CONFIG_FLAG_CALLBACK_PRE) != 0)
     if (canopenNodeSTM32->signalHBconsumer != NULL) {
         CO_HBconsumer_initCallbackPre(CO->HBcons, CO->HBcons, canopenNodeSTM32->signalHBconsumer);
     }
@@ -224,8 +236,9 @@ canopen_app_resetCommunication() {
 #endif
 
     /* Configure Timer interrupt function for execution every 1 millisecond */
-    if(canopenNodeSTM32->timerHandle != NULL)
-    	HAL_TIM_Base_Start_IT(canopenNodeSTM32->timerHandle); //1ms interrupt
+    if (canopenNodeSTM32->timerHandle != NULL) {
+        HAL_TIM_Base_Start_IT(canopenNodeSTM32->timerHandle); // 1ms interrupt
+    }
 
     /* Configure CAN transmit and receive interrupt */
 
@@ -260,15 +273,15 @@ canopen_app_process(void) {
 
     uint32_t timerNext_us = UINT32_MAX;
     CO_NMT_reset_cmd_t reset_status = CO_process(CO, false, timeDifference_us, &timerNext_us);
-#if ((CO_CONFIG_LEDS)&CO_CONFIG_LEDS_ENABLE) != 0
+#if ((CO_CONFIG_LEDS) & CO_CONFIG_LEDS_ENABLE) != 0
     canopenNodeSTM32->outStatusLEDRed = CO_LED_RED(CO->LEDs, CO_LED_CANopen);
     canopenNodeSTM32->outStatusLEDGreen = CO_LED_GREEN(CO->LEDs, CO_LED_CANopen);
 #endif
 
     if (reset_status == CO_RESET_COMM) {
         /* The same objects are initialized again, as in the examples of CANopenNode, instead of
-         * deleted and allocated again (CO_delete, canopen_app_init): the application keeps pointers to
-         * them (the SDO clients of the controller's request task and firmware update) */
+         * deleted and allocated again (CO_delete, canopen_app_init): the application may keep
+         * pointers to them (e.g. the SDO clients) */
         if (canopenNodeSTM32->timerHandle != NULL) {
             HAL_TIM_Base_Stop_IT(canopenNodeSTM32->timerHandle);
         }
@@ -293,7 +306,9 @@ canopen_app_interrupt(void) {
         uint32_t now = canopen_app_get_time();
         uint32_t timeDifference_us = now - interrupt_time_old; // 1ms second
         interrupt_time_old = now;
-        if(timeDifference_us == 0) timeDifference_us = 1000;
+        if (timeDifference_us == 0) {
+            timeDifference_us = 1000;
+        }
 
 #if (CO_CONFIG_SYNC) & CO_CONFIG_SYNC_ENABLE
         syncWas = CO_process_SYNC(CO, timeDifference_us, NULL);
