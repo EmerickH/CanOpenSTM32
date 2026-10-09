@@ -47,6 +47,12 @@ typedef struct {
 
     void (*HWInitFunction)(); /* Pass in the function that initialize the CAN peripheral, usually MX_CAN_Init */
 
+#if CO_STM32_PHY_COUNT > 1
+    /* Second physical bus (phy 1; phy 0 is CANHandle) */
+    FDCAN_HandleTypeDef* CANHandle2;
+    void (*HWInitFunction2)();
+#endif
+
     uint8_t outStatusLEDGreen; // This will be updated by the stack - Use them for the LED management
     uint8_t outStatusLEDRed;   // This will be updated by the stack - Use them for the LED management
     CO_t* canOpenStack;

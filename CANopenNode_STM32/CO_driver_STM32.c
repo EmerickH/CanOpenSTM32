@@ -30,6 +30,9 @@
  */
 #include "301/CO_driver.h"
 #include "CO_app_STM32.h"
+#if CO_STM32_PHY_COUNT > 1
+#include <string.h>
+#endif
 
 /* Local CAN module object */
 static CO_CANmodule_t* CANModule_local = NULL; /* Local instance of global CAN module */
@@ -54,6 +57,9 @@ CO_CANsetConfigurationMode(void* CANptr) {
     if (CANptr != NULL) {
 #ifdef CO_STM32_FDCAN_Driver
         HAL_FDCAN_Stop(((CANopenNodeSTM32*)CANptr)->CANHandle);
+#if CO_STM32_PHY_COUNT > 1
+        HAL_FDCAN_Stop(((CANopenNodeSTM32*)CANptr)->CANHandle2);
+#endif
 #else
         HAL_CAN_Stop(((CANopenNodeSTM32*)CANptr)->CANHandle);
 #endif
@@ -66,6 +72,15 @@ CO_CANsetNormalMode(CO_CANmodule_t* CANmodule) {
     /* Put CAN module in normal mode */
     if (CANmodule->CANptr != NULL) {
 #ifdef CO_STM32_FDCAN_Driver
+#if CO_STM32_PHY_COUNT > 1
+        /* Both phys start "up" for CO_CANPHY_UP_MS, so that the first broadcasts (NMT reset, TIME) go out */
+        uint32_t now = HAL_GetTick();
+        for (uint8_t p = 0; p < CO_STM32_PHY_COUNT; p++) {
+            CANmodule->lastRxMs[p] = now;
+            CANmodule->up[p] = true;
+        }
+        HAL_FDCAN_Start(((CANopenNodeSTM32*)CANmodule->CANptr)->CANHandle2);
+#endif
         if (HAL_FDCAN_Start(((CANopenNodeSTM32*)CANmodule->CANptr)->CANHandle) == HAL_OK)
 #else
         if (HAL_CAN_Start(((CANopenNodeSTM32*)CANmodule->CANptr)->CANHandle) == HAL_OK)
@@ -104,6 +119,15 @@ CO_CANmodule_init(CO_CANmodule_t* CANmodule, void* CANptr, CO_CANrx_t rxArray[],
     CANmodule->firstCANtxMessage = true;
     CANmodule->CANtxCount = 0U;
     CANmodule->errOld = 0U;
+#if CO_STM32_PHY_COUNT > 1
+    for (uint8_t p = 0; p < CO_STM32_PHY_COUNT; p++) {
+        CANmodule->errOldPhy[p] = 0U;
+        CANmodule->lastRxMs[p] = 0U;
+        CANmodule->up[p] = false;
+        CANmodule->lost[p] = 0U;
+        CANmodule->dropped[p] = 0U;
+    }
+#endif
 
     /* Reset all variables */
     for (uint16_t i = 0U; i < rxSize; i++) {
@@ -114,12 +138,18 @@ CO_CANmodule_init(CO_CANmodule_t* CANmodule, void* CANptr, CO_CANrx_t rxArray[],
     }
     for (uint16_t i = 0U; i < txSize; i++) {
         txArray[i].bufferFull = false;
+#if CO_STM32_PHY_COUNT > 1
+        txArray[i].phyPending = 0U;
+#endif
     }
 
     /***************************************/
     /* STM32 related configuration */
     /***************************************/
     ((CANopenNodeSTM32*)CANptr)->HWInitFunction();
+#if CO_STM32_PHY_COUNT > 1
+    ((CANopenNodeSTM32*)CANptr)->HWInitFunction2();
+#endif
 
     /*
      * Configure global filter that is used as last check if message did not pass any of other filters:
@@ -137,6 +167,13 @@ CO_CANmodule_init(CO_CANmodule_t* CANmodule, void* CANptr, CO_CANrx_t rxArray[],
         != HAL_OK) {
         return CO_ERROR_ILLEGAL_ARGUMENT;
     }
+#if CO_STM32_PHY_COUNT > 1
+    if (HAL_FDCAN_ConfigGlobalFilter(((CANopenNodeSTM32*)CANptr)->CANHandle2, FDCAN_ACCEPT_IN_RX_FIFO0, FDCAN_REJECT,
+                                     FDCAN_FILTER_REMOTE, FDCAN_FILTER_REMOTE)
+        != HAL_OK) {
+        return CO_ERROR_ILLEGAL_ARGUMENT;
+    }
+#endif
 #else
     CAN_FilterTypeDef FilterConfig;
 #if defined(CAN)
@@ -176,6 +213,18 @@ CO_CANmodule_init(CO_CANmodule_t* CANmodule, void* CANptr, CO_CANrx_t rxArray[],
         != HAL_OK) {
         return CO_ERROR_ILLEGAL_ARGUMENT;
     }
+#if CO_STM32_PHY_COUNT > 1
+    if (HAL_FDCAN_ActivateNotification(((CANopenNodeSTM32*)CANptr)->CANHandle2,
+                                       0 | FDCAN_IT_RX_FIFO0_NEW_MESSAGE | FDCAN_IT_RX_FIFO1_NEW_MESSAGE
+                                           | FDCAN_IT_RX_FIFO0_MESSAGE_LOST | FDCAN_IT_RX_FIFO1_MESSAGE_LOST
+                                           | FDCAN_IT_TX_COMPLETE | FDCAN_IT_TX_FIFO_EMPTY | FDCAN_IT_BUS_OFF
+                                           | FDCAN_IT_ARB_PROTOCOL_ERROR | FDCAN_IT_DATA_PROTOCOL_ERROR
+                                           | FDCAN_IT_ERROR_PASSIVE | FDCAN_IT_ERROR_WARNING,
+                                       BUFFERE_INDEXES)
+        != HAL_OK) {
+        return CO_ERROR_ILLEGAL_ARGUMENT;
+    }
+#endif
 #else
     if (HAL_CAN_ActivateNotification(((CANopenNodeSTM32*)CANptr)->CANHandle, CAN_IT_RX_FIFO0_MSG_PENDING
                                                                                  | CAN_IT_RX_FIFO1_MSG_PENDING
@@ -194,7 +243,9 @@ CO_CANmodule_disable(CO_CANmodule_t* CANmodule) {
     if (CANmodule != NULL && CANmodule->CANptr != NULL) {
 #ifdef CO_STM32_FDCAN_Driver
         HAL_FDCAN_Stop(((CANopenNodeSTM32*)CANmodule->CANptr)->CANHandle);
-
+#if CO_STM32_PHY_COUNT > 1
+        HAL_FDCAN_Stop(((CANopenNodeSTM32*)CANmodule->CANptr)->CANHandle2);
+#endif
 #else
         HAL_CAN_Stop(((CANopenNodeSTM32*)CANmodule->CANptr)->CANHandle);
 #endif
@@ -246,11 +297,110 @@ CO_CANtxBufferInit(CO_CANmodule_t* CANmodule, uint16_t index, uint16_t ident, bo
         buffer->ident = ((uint32_t)ident & CANID_MASK) | ((uint32_t)(rtr ? FLAG_RTR : 0x00));
         buffer->DLC = noOfBytes;
         buffer->bufferFull = false;
+#if CO_STM32_PHY_COUNT > 1
+        buffer->phyPending = 0U;
+#endif
         buffer->syncFlag = syncFlag;
     }
     return buffer;
 }
 
+#if CO_STM32_PHY_COUNT > 1
+/* Two physical buses. phy 0 = CANHandle, phy 1 = CANHandle2. */
+
+static FDCAN_HandleTypeDef*
+prv_phy_handle(CO_CANmodule_t* CANmodule, uint8_t phy) {
+    CANopenNodeSTM32* app = (CANopenNodeSTM32*)CANmodule->CANptr;
+    return phy ? app->CANHandle2 : app->CANHandle;
+}
+
+static uint8_t
+prv_phy_of(CO_CANmodule_t* CANmodule, FDCAN_HandleTypeDef* hfdcan) {
+    return hfdcan == ((CANopenNodeSTM32*)CANmodule->CANptr)->CANHandle2 ? 1U : 0U;
+}
+
+static const uint32_t prv_dlc_map[9] = {FDCAN_DLC_BYTES_0, FDCAN_DLC_BYTES_1, FDCAN_DLC_BYTES_2,
+                                        FDCAN_DLC_BYTES_3, FDCAN_DLC_BYTES_4, FDCAN_DLC_BYTES_5,
+                                        FDCAN_DLC_BYTES_6, FDCAN_DLC_BYTES_7, FDCAN_DLC_BYTES_8};
+
+/**
+ * \brief           Put one frame in the TX FIFO of a phy. Must be called with atomic access.
+ * \param[in]       ident: 11 bits identifier, with FLAG_RTR
+ * \return          1 if the frame was queued
+ */
+static uint8_t
+prv_send_frame(FDCAN_HandleTypeDef* hfdcan, uint32_t ident, uint8_t dlc, uint8_t* data) {
+    static FDCAN_TxHeaderTypeDef tx_hdr; /* shared by both phys: always filled under CO_LOCK_CAN_SEND */
+
+    if (HAL_FDCAN_GetTxFifoFreeLevel(hfdcan) == 0U) {
+        return 0;
+    }
+    tx_hdr.Identifier = ident & CANID_MASK;
+    tx_hdr.TxFrameType = (ident & FLAG_RTR) ? FDCAN_REMOTE_FRAME : FDCAN_DATA_FRAME;
+    tx_hdr.IdType = FDCAN_STANDARD_ID;
+    tx_hdr.FDFormat = FDCAN_CLASSIC_CAN;
+    tx_hdr.BitRateSwitch = FDCAN_BRS_OFF;
+    tx_hdr.MessageMarker = 0;
+    tx_hdr.ErrorStateIndicator = FDCAN_ESI_ACTIVE;
+    tx_hdr.TxEventFifoControl = FDCAN_NO_TX_EVENTS;
+    tx_hdr.DataLength = prv_dlc_map[dlc > 8U ? 8U : dlc];
+    return HAL_FDCAN_AddMessageToTxFifoQ(hfdcan, &tx_hdr, data) == HAL_OK;
+}
+
+/**
+ * \brief           Route a buffer to the phys of the mask and send it. Must be called with atomic access.
+ *                  The buffer itself is never rewritten: each phy gets a rewritten copy.
+ * \return          the phys (bits) that are routed, up, and could not take the frame now
+ */
+static uint8_t
+prv_route_send(CO_CANmodule_t* CANmodule, const CO_CANtx_t* buffer, uint8_t phys, bool* sent) {
+    uint8_t pending = 0;
+
+    for (uint8_t p = 0; p < CO_STM32_PHY_COUNT; p++) {
+        if (!(phys & (1U << p))) {
+            continue;
+        }
+        uint16_t ident = (uint16_t)(buffer->ident & CANID_MASK);
+        uint8_t data[8];
+        memcpy(data, buffer->data, sizeof(data));
+        if (!CO_CANphyTx(p, &ident, data, buffer->DLC)) {
+            continue; /* the frame is not for this bus */
+        }
+        if (!CANmodule->up[p]) {
+            CANmodule->dropped[p]++;
+            continue;
+        }
+        if (prv_send_frame(prv_phy_handle(CANmodule, p), (buffer->ident & FLAG_RTR) | ident, buffer->DLC, data)) {
+            *sent = true;
+        } else {
+            pending |= (uint8_t)(1U << p);
+        }
+    }
+    return pending;
+}
+
+/* A phy went down: abort what it has in its TX FIFO and forget the frames still to be sent on it */
+static void
+prv_phy_down(CO_CANmodule_t* CANmodule, uint8_t phy) {
+    CO_LOCK_CAN_SEND(CANmodule);
+    /* a frame may have come in since the caller checked */
+    if ((int32_t)(HAL_GetTick() - CANmodule->lastRxMs[phy]) < (int32_t)CO_CANPHY_UP_MS) {
+        CO_UNLOCK_CAN_SEND(CANmodule);
+        return;
+    }
+    CANmodule->up[phy] = false;
+    HAL_FDCAN_AbortTxRequest(prv_phy_handle(CANmodule, phy), BUFFERE_INDEXES);
+    CO_CANtx_t* buffer = &CANmodule->txArray[0];
+    for (uint16_t i = CANmodule->txSize; i > 0U; i--, buffer++) {
+        buffer->phyPending &= (uint8_t)~(1U << phy);
+        if (buffer->bufferFull && buffer->phyPending == 0U) {
+            buffer->bufferFull = false;
+            CANmodule->CANtxCount--;
+        }
+    }
+    CO_UNLOCK_CAN_SEND(CANmodule);
+}
+#else
 /**
  * \brief           Send CAN message to network
  * This function must be called with atomic access.
@@ -341,6 +491,7 @@ prv_send_can_message(CO_CANmodule_t* CANmodule, CO_CANtx_t* buffer) {
 #endif
     return success;
 }
+#endif
 
 /******************************************************************************/
 CO_ReturnError_t
@@ -362,6 +513,24 @@ CO_CANsend(CO_CANmodule_t* CANmodule, CO_CANtx_t* buffer) {
      * Lock interrupts for atomic operation
      */
     CO_LOCK_CAN_SEND(CANmodule);
+#if CO_STM32_PHY_COUNT > 1
+    {
+        bool sent = false;
+        bool wasFull = buffer->bufferFull;
+        /* The phys that could not take the frame keep it pending (bufferFull = something pending) */
+        uint8_t pending = prv_route_send(CANmodule, buffer, (1U << CO_STM32_PHY_COUNT) - 1U, &sent);
+        if (sent) {
+            CANmodule->bufferInhibitFlag = buffer->syncFlag;
+        }
+        buffer->phyPending = pending;
+        buffer->bufferFull = pending != 0U;
+        if (pending != 0U && !wasFull) {
+            CANmodule->CANtxCount++;
+        } else if (pending == 0U && wasFull) {
+            CANmodule->CANtxCount--;
+        }
+    }
+#else
     if (prv_send_can_message(CANmodule, buffer)) {
         CANmodule->bufferInhibitFlag = buffer->syncFlag;
     } else {
@@ -371,6 +540,7 @@ CO_CANsend(CO_CANmodule_t* CANmodule, CO_CANtx_t* buffer) {
             CANmodule->CANtxCount++;
         }
     }
+#endif
     CO_UNLOCK_CAN_SEND(CANmodule);
 
     return err;
@@ -396,6 +566,9 @@ CO_CANclearPendingSyncPDOs(CO_CANmodule_t* CANmodule) {
         for (i = CANmodule->txSize; i > 0U; i--) {
             if (buffer->bufferFull) {
                 if (buffer->syncFlag) {
+#if CO_STM32_PHY_COUNT > 1
+                    buffer->phyPending = 0U;
+#endif
                     buffer->bufferFull = false;
                     CANmodule->CANtxCount--;
                     tpdoDeleted = 2U;
@@ -414,6 +587,77 @@ CO_CANclearPendingSyncPDOs(CO_CANmodule_t* CANmodule) {
 /* Get error counters from the module. If necessary, function may use
     * different way to determine errors. */
 
+#if CO_STM32_PHY_COUNT > 1
+void
+CO_CANmodule_process(CO_CANmodule_t* CANmodule) {
+    uint32_t errAll = 0;
+    bool changed = false;
+    uint32_t now = HAL_GetTick();
+
+    for (uint8_t p = 0; p < CO_STM32_PHY_COUNT; p++) {
+        /* signed difference: a frame may be stamped by an interrupt after "now" was read */
+        if (CANmodule->up[p] && (int32_t)(now - CANmodule->lastRxMs[p]) >= (int32_t)CO_CANPHY_UP_MS) {
+            prv_phy_down(CANmodule, p);
+        }
+        /* The errors of a bus that is down (unused connector) don't count */
+        uint32_t err = 0;
+        if (CANmodule->up[p]) {
+            err = prv_phy_handle(CANmodule, p)->Instance->PSR & (FDCAN_PSR_BO | FDCAN_PSR_EW | FDCAN_PSR_EP);
+        }
+        if (CANmodule->errOldPhy[p] != err) {
+            CANmodule->errOldPhy[p] = err;
+            changed = true;
+        }
+        errAll |= err;
+    }
+
+    if (changed) {
+        uint16_t status = CANmodule->CANerrorStatus;
+
+        if (errAll & FDCAN_PSR_BO) {
+            status |= CO_CAN_ERRTX_BUS_OFF;
+        } else {
+            status &= 0xFFFF
+                      ^ (CO_CAN_ERRTX_BUS_OFF | CO_CAN_ERRRX_WARNING | CO_CAN_ERRRX_PASSIVE | CO_CAN_ERRTX_WARNING
+                         | CO_CAN_ERRTX_PASSIVE);
+            if (errAll & FDCAN_PSR_EW) {
+                status |= CO_CAN_ERRRX_WARNING | CO_CAN_ERRTX_WARNING;
+            }
+            if (errAll & FDCAN_PSR_EP) {
+                status |= CO_CAN_ERRRX_PASSIVE | CO_CAN_ERRTX_PASSIVE;
+            }
+        }
+        CANmodule->CANerrorStatus = status;
+    }
+}
+
+/******************************************************************************/
+void
+CO_CANphyGetStatus(CO_CANmodule_t* CANmodule, uint8_t phy, CO_CANphyStatus_t* status) {
+    memset(status, 0, sizeof(*status));
+    if (phy >= CO_STM32_PHY_COUNT) {
+        return;
+    }
+    FDCAN_GlobalTypeDef* can = prv_phy_handle(CANmodule, phy)->Instance;
+    uint32_t psr = can->PSR;
+    uint32_t ecr = can->ECR;
+
+    status->up = CANmodule->up[phy];
+    if (psr & FDCAN_PSR_BO) {
+        status->state = CO_CANPHY_BUSOFF;
+    } else if (psr & FDCAN_PSR_EP) {
+        status->state = CO_CANPHY_PASSIVE;
+    } else if (psr & FDCAN_PSR_EW) {
+        status->state = CO_CANPHY_WARNING;
+    } else {
+        status->state = CO_CANPHY_ACTIVE;
+    }
+    status->tec = (uint8_t)(ecr & 0xFFU);
+    status->rec = (uint8_t)((ecr >> 8) & 0x7FU);
+    status->lost = CANmodule->lost[phy];
+    status->dropped = CANmodule->dropped[phy];
+}
+#else
 void
 CO_CANmodule_process(CO_CANmodule_t* CANmodule) {
     uint32_t err = 0;
@@ -489,6 +733,7 @@ CO_CANmodule_process(CO_CANmodule_t* CANmodule) {
 
 #endif
 }
+#endif
 
 /**
  * \brief           Read message from RX FIFO
@@ -513,6 +758,7 @@ prv_read_can_received_msg(CAN_HandleTypeDef* hcan, uint32_t fifo, uint32_t fifo_
     uint8_t messageFound = 0;
 
 #ifdef CO_STM32_FDCAN_Driver
+    /* static: safe because the interrupts of both FDCAN have the same priority (5), they don't preempt each other */
     static FDCAN_RxHeaderTypeDef rx_hdr;
     /* Read received message from FIFO */
     if (HAL_FDCAN_GetRxMessage(hfdcan, fifo, &rx_hdr, rcvMsg.data) != HAL_OK) {
@@ -553,6 +799,21 @@ prv_read_can_received_msg(CAN_HandleTypeDef* hcan, uint32_t fifo, uint32_t fifo_
             break; /* Invalid length when more than 8 */
     }
     rcvMsgIdent = rcvMsg.ident;
+#if CO_STM32_PHY_COUNT > 1
+    {
+        uint8_t phy = prv_phy_of(CANModule_local, hfdcan);
+        /* Any frame, even one that is dropped below, shows the bus is alive */
+        CANModule_local->lastRxMs[phy] = HAL_GetTick();
+        CANModule_local->up[phy] = true;
+
+        uint16_t ident = (uint16_t)(rcvMsg.ident & CANID_MASK);
+        if (!CO_CANphyRx(phy, &ident, rcvMsg.data, rcvMsg.dlc)) {
+            return;
+        }
+        rcvMsg.ident = (rcvMsg.ident & FLAG_RTR) | ident;
+        rcvMsgIdent = rcvMsg.ident;
+    }
+#endif
 #else
     static CAN_RxHeaderTypeDef rx_hdr;
     /* Read received message from FIFO */
@@ -602,6 +863,9 @@ void
 HAL_FDCAN_RxFifo0Callback(FDCAN_HandleTypeDef* hfdcan, uint32_t RxFifo0ITs) {
     if (RxFifo0ITs & FDCAN_IT_RX_FIFO0_MESSAGE_LOST) {
         CO_CANrxLostFrames++;
+#if CO_STM32_PHY_COUNT > 1
+        CANModule_local->lost[prv_phy_of(CANModule_local, hfdcan)]++;
+#endif
     }
     if (RxFifo0ITs & FDCAN_IT_RX_FIFO0_NEW_MESSAGE) {
         prv_read_can_received_msg(hfdcan, FDCAN_RX_FIFO0, RxFifo0ITs);
@@ -618,6 +882,9 @@ void
 HAL_FDCAN_RxFifo1Callback(FDCAN_HandleTypeDef* hfdcan, uint32_t RxFifo1ITs) {
     if (RxFifo1ITs & FDCAN_IT_RX_FIFO1_MESSAGE_LOST) {
         CO_CANrxLostFrames++;
+#if CO_STM32_PHY_COUNT > 1
+        CANModule_local->lost[prv_phy_of(CANModule_local, hfdcan)]++;
+#endif
     }
     if (RxFifo1ITs & FDCAN_IT_RX_FIFO1_NEW_MESSAGE) {
         prv_read_can_received_msg(hfdcan, FDCAN_RX_FIFO1, RxFifo1ITs);
@@ -647,6 +914,27 @@ HAL_FDCAN_TxBufferCompleteCallback(FDCAN_HandleTypeDef* hfdcan, uint32_t BufferI
          *  then no need to lock interrupts..)
          */
         CO_LOCK_CAN_SEND(CANModule_local);
+#if CO_STM32_PHY_COUNT > 1
+        /* This callback is for one phy: retry only the buffers still pending on it */
+        const uint8_t bit = (uint8_t)(1U << prv_phy_of(CANModule_local, hfdcan));
+        for (i = CANModule_local->txSize; i > 0U; --i, ++buffer) {
+            if (buffer->bufferFull && (buffer->phyPending & bit)) {
+                bool sent = false;
+                uint8_t again = prv_route_send(CANModule_local, buffer, bit, &sent);
+                if (sent) {
+                    CANModule_local->bufferInhibitFlag = buffer->syncFlag;
+                }
+                buffer->phyPending = (uint8_t)((buffer->phyPending & ~bit) | again);
+                if (buffer->phyPending == 0U) {
+                    buffer->bufferFull = false;
+                    CANModule_local->CANtxCount--;
+                }
+                if (again) {
+                    break; /* the TX FIFO of this phy is full */
+                }
+            }
+        }
+#else
         for (i = CANModule_local->txSize; i > 0U; --i, ++buffer) {
             /* Try to send message */
             if (buffer->bufferFull) {
@@ -659,6 +947,7 @@ HAL_FDCAN_TxBufferCompleteCallback(FDCAN_HandleTypeDef* hfdcan, uint32_t BufferI
                 }
             }
         }
+#endif
         CO_UNLOCK_CAN_SEND(CANModule_local);
     }
 }

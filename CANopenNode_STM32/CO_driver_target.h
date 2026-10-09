@@ -45,6 +45,15 @@
 #error This STM32 Do not support CAN or FDCAN
 #endif
 
+/* Number of physical CAN buses served by the one stack (FDCAN only). 1 = the original driver.
+ * The application sets 2 (see CO_CANphyRx/CO_CANphyTx below). */
+#ifndef CO_STM32_PHY_COUNT
+#define CO_STM32_PHY_COUNT 1
+#endif
+#if CO_STM32_PHY_COUNT > 1 && !defined(CO_STM32_FDCAN_Driver)
+#error CO_STM32_PHY_COUNT > 1 needs the FDCAN driver
+#endif
+
 #undef CO_CONFIG_STORAGE_ENABLE // We don't need Storage option, implement based on your use case and remove this line from here
 
 #ifdef CO_DRIVER_CUSTOM
@@ -102,6 +111,9 @@ typedef struct {
     uint8_t data[8];
     volatile bool_t bufferFull;
     volatile bool_t syncFlag;
+#if CO_STM32_PHY_COUNT > 1
+    volatile uint8_t phyPending; /* bit per phy where the frame is still to be sent (bufferFull = phyPending != 0) */
+#endif
 } CO_CANtx_t;
 
 /* CAN module object */
@@ -118,6 +130,13 @@ typedef struct {
     volatile bool_t firstCANtxMessage;
     volatile uint16_t CANtxCount;
     uint32_t errOld;
+#if CO_STM32_PHY_COUNT > 1
+    uint32_t errOldPhy[CO_STM32_PHY_COUNT];       /* last error flags (PSR) of each phy that is up */
+    volatile uint32_t lastRxMs[CO_STM32_PHY_COUNT]; /* HAL tick of the last frame received on each phy */
+    volatile bool_t up[CO_STM32_PHY_COUNT];       /* a frame was received in the last CO_CANPHY_UP_MS */
+    volatile uint32_t lost[CO_STM32_PHY_COUNT];   /* receive FIFO overruns */
+    volatile uint32_t dropped[CO_STM32_PHY_COUNT]; /* frames routed to a phy that was down */
+#endif
 
     /* STM32 specific features */
     uint32_t primask_send; /* Primask register for interrupts for send operation */
@@ -125,6 +144,34 @@ typedef struct {
     uint32_t primask_od;   /* Primask register for interrupts for send operation */
 
 } CO_CANmodule_t;
+
+#if CO_STM32_PHY_COUNT > 1
+/* A phy is "up" while a frame was received on it in the last CO_CANPHY_UP_MS (nodes send a heartbeat per second).
+ * A down phy gets no frames, so an empty bus never fills its TX FIFO. */
+#define CO_CANPHY_UP_MS 3000U
+
+#define CO_CANPHY_ACTIVE  0
+#define CO_CANPHY_WARNING 1
+#define CO_CANPHY_PASSIVE 2
+#define CO_CANPHY_BUSOFF  3
+
+/* Given by the application . They translate the node ids
+ * between the logical ids of the stack and the physical ids of each bus. Called from interrupts and with
+ * interrupts masked: no blocking, no logging.
+ * Rx: false drops the frame, else *ident is the logical COB-ID (11 bits).
+ * Tx: whether the frame goes on bus phy; *ident and data (8 bytes, a copy) are rewritten for that bus. */
+bool CO_CANphyRx(uint8_t phy, uint16_t* ident, const uint8_t* data, uint8_t dlc);
+bool CO_CANphyTx(uint8_t phy, uint16_t* ident, uint8_t* data, uint8_t dlc);
+
+typedef struct {
+    bool up;
+    uint8_t state; /* CO_CANPHY_* */
+    uint8_t tec, rec;
+    uint32_t lost, dropped;
+} CO_CANphyStatus_t;
+
+void CO_CANphyGetStatus(CO_CANmodule_t* CANmodule, uint8_t phy, CO_CANphyStatus_t* status);
+#endif
 
 /* Data storage object for one entry */
 typedef struct {
