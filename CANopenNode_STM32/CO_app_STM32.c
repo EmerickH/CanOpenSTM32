@@ -57,7 +57,7 @@ CANopenNodeSTM32*
 CO_t* CO = NULL; /* CANopen object */
 
 // Global variables
-uint32_t time_old, time_current;
+uint32_t time_old;
 uint32_t interrupt_time_old;
 CO_ReturnError_t err;
 
@@ -186,6 +186,43 @@ canopen_app_resetCommunication() {
         return 4;
     }
 
+    /* Signal callbacks of the application (see CO_app_STM32.h) */
+#if ((CO_CONFIG_NMT) & CO_CONFIG_FLAG_CALLBACK_PRE) != 0
+    if (canopenNodeSTM32->signalNMT != NULL) {
+        CO_NMT_initCallbackPre(CO->NMT, CO->NMT, canopenNodeSTM32->signalNMT);
+    }
+#endif
+#if ((CO_CONFIG_EM) & CO_CONFIG_FLAG_CALLBACK_PRE) != 0
+    if (canopenNodeSTM32->signalEM != NULL) {
+        CO_EM_initCallbackPre(CO->em, CO->em, canopenNodeSTM32->signalEM);
+    }
+#endif
+#if ((CO_CONFIG_SDO_SRV) & CO_CONFIG_FLAG_CALLBACK_PRE) != 0
+    if (canopenNodeSTM32->signalSDOserver != NULL) {
+        for (int i = 0; i < OD_CNT_SDO_SRV; i++) {
+            CO_SDOserver_initCallbackPre(&CO->SDOserver[i], &CO->SDOserver[i], canopenNodeSTM32->signalSDOserver);
+        }
+    }
+#endif
+#if (((CO_CONFIG_SDO_CLI) & CO_CONFIG_SDO_CLI_ENABLE) != 0) && (((CO_CONFIG_SDO_CLI) & CO_CONFIG_FLAG_CALLBACK_PRE) != 0) \
+    && defined(OD_CNT_SDO_CLI)
+    if (canopenNodeSTM32->signalSDOclient != NULL) {
+        for (int i = 0; i < OD_CNT_SDO_CLI; i++) {
+            CO_SDOclient_initCallbackPre(&CO->SDOclient[i], &CO->SDOclient[i], canopenNodeSTM32->signalSDOclient);
+        }
+    }
+#endif
+#if (((CO_CONFIG_HB_CONS) & CO_CONFIG_HB_CONS_ENABLE) != 0) && (((CO_CONFIG_HB_CONS) & CO_CONFIG_FLAG_CALLBACK_PRE) != 0)
+    if (canopenNodeSTM32->signalHBconsumer != NULL) {
+        CO_HBconsumer_initCallbackPre(CO->HBcons, CO->HBcons, canopenNodeSTM32->signalHBconsumer);
+    }
+#endif
+#if (((CO_CONFIG_TIME) & CO_CONFIG_TIME_ENABLE) != 0) && (((CO_CONFIG_TIME) & CO_CONFIG_FLAG_CALLBACK_PRE) != 0)
+    if (canopenNodeSTM32->signalTIME != NULL) {
+        CO_TIME_initCallbackPre(CO->TIME, CO->TIME, canopenNodeSTM32->signalTIME);
+    }
+#endif
+
     /* Configure Timer interrupt function for execution every 1 millisecond */
     if(canopenNodeSTM32->timerHandle != NULL)
     	HAL_TIM_Base_Start_IT(canopenNodeSTM32->timerHandle); //1ms interrupt
@@ -209,39 +246,40 @@ canopen_app_resetCommunication() {
 
     log_printf("CANopenNode - Running...\n");
     fflush(stdout);
-    time_old = time_current = interrupt_time_old = canopen_app_get_time();
+    time_old = interrupt_time_old = canopen_app_get_time();
     return 0;
 }
 
-void
-canopen_app_process() {
-    /* loop for normal program execution ******************************************/
-    /* get time difference since last function call */
-    time_current = canopen_app_get_time();
+uint32_t
+canopen_app_process(void) {
+    /* No "elapsed > 0" guard: the task can wake within the same tick of the clock to process a frame
+     * (CO_process with a zero time difference does that). Returns timerNext_us. */
+    uint32_t now = canopen_app_get_time();
+    uint32_t timeDifference_us = now - time_old;
+    time_old = now;
 
-    if ((time_current - time_old) > 0) { // Make sure more than 1ms elapsed
-        /* CANopen process */
-        CO_NMT_reset_cmd_t reset_status;
-        uint32_t timeDifference_us = time_current - time_old;
-        time_old = time_current;
-        reset_status = CO_process(CO, false, timeDifference_us, NULL);
+    uint32_t timerNext_us = UINT32_MAX;
+    CO_NMT_reset_cmd_t reset_status = CO_process(CO, false, timeDifference_us, &timerNext_us);
 #if ((CO_CONFIG_LEDS)&CO_CONFIG_LEDS_ENABLE) != 0
-        canopenNodeSTM32->outStatusLEDRed = CO_LED_RED(CO->LEDs, CO_LED_CANopen);
-        canopenNodeSTM32->outStatusLEDGreen = CO_LED_GREEN(CO->LEDs, CO_LED_CANopen);
+    canopenNodeSTM32->outStatusLEDRed = CO_LED_RED(CO->LEDs, CO_LED_CANopen);
+    canopenNodeSTM32->outStatusLEDGreen = CO_LED_GREEN(CO->LEDs, CO_LED_CANopen);
 #endif
 
-        if (reset_status == CO_RESET_COMM) {
-            /* delete objects from memory */
-        	HAL_TIM_Base_Stop_IT(canopenNodeSTM32->timerHandle);
-            CO_CANsetConfigurationMode((void*)canopenNodeSTM32);
-            CO_delete(CO);
-            log_printf("CANopenNode Reset Communication request\n");
-            canopen_app_init(canopenNodeSTM32); // Reset Communication routine
-        } else if (reset_status == CO_RESET_APP) {
-            log_printf("CANopenNode Device Reset\n");
-            HAL_NVIC_SystemReset(); // Reset the STM32 Microcontroller
+    if (reset_status == CO_RESET_COMM) {
+        /* delete objects from memory */
+        if (canopenNodeSTM32->timerHandle != NULL) {
+            HAL_TIM_Base_Stop_IT(canopenNodeSTM32->timerHandle);
         }
+        CO_CANsetConfigurationMode((void*)canopenNodeSTM32);
+        CO_delete(CO);
+        log_printf("CANopenNode Reset Communication request\n");
+        canopen_app_init(canopenNodeSTM32); // Reset Communication routine
+        return 0;
+    } else if (reset_status == CO_RESET_APP) {
+        log_printf("CANopenNode Device Reset\n");
+        HAL_NVIC_SystemReset(); // Reset the STM32 Microcontroller
     }
+    return timerNext_us;
 }
 
 /* Thread function executes in constant intervals, this function can be called from FreeRTOS tasks or Timers ********/
@@ -251,9 +289,10 @@ canopen_app_interrupt(void) {
     if (!CO->nodeIdUnconfigured && CO->CANmodule->CANnormal) {
         bool_t syncWas = false;
         /* get time difference since last function call */
-        time_current = canopen_app_get_time();
-        uint32_t timeDifference_us = time_current - interrupt_time_old; // 1ms second
-        interrupt_time_old = time_current;
+        /* Local, the CANopen task has its own time (canopen_app_process) */
+        uint32_t now = canopen_app_get_time();
+        uint32_t timeDifference_us = now - interrupt_time_old; // 1ms second
+        interrupt_time_old = now;
         if(timeDifference_us == 0) timeDifference_us = 1000;
 
 #if (CO_CONFIG_SYNC) & CO_CONFIG_SYNC_ENABLE

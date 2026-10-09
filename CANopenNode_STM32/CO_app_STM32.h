@@ -53,6 +53,20 @@ typedef struct {
     void (*HWInitFunction2)();
 #endif
 
+    /* Optional signal callbacks, NULL = none. Called when a received frame (or an emergency to send)
+     * needs processing: from the CAN interrupt, and EM also from the task that reports the error, so
+     * they must wake the CANopen task and nothing else. Registered at each communication reset, only
+     * if the object's CO_CONFIG_* has CO_CONFIG_FLAG_CALLBACK_PRE (set CO_CONFIG_GLOBAL_FLAG_CALLBACK_PRE
+     * in CO_Custom_Config.h). The argument is the object (CO->NMT, CO->em, &CO->SDOserver[i],
+     * &CO->SDOclient[i], CO->HBcons, CO->TIME). SYNC and RPDO are not covered: they are processed by
+     * canopen_app_interrupt(). */
+    void (*signalNMT)(void* object);
+    void (*signalEM)(void* object);
+    void (*signalSDOserver)(void* object);
+    void (*signalSDOclient)(void* object);
+    void (*signalHBconsumer)(void* object);
+    void (*signalTIME)(void* object);
+
     uint8_t outStatusLEDGreen; // This will be updated by the stack - Use them for the LED management
     uint8_t outStatusLEDRed;   // This will be updated by the stack - Use them for the LED management
     CO_t* canOpenStack;
@@ -71,7 +85,9 @@ uint32_t canopen_app_get_time();
 /* This function will reset the CAN communication periperhal and also the CANOpen stack variables */
 int canopen_app_resetCommunication();
 /* This function will check the input buffers and any outstanding tasks that are not time critical, this function should be called regurarly from your code (i.e from your while(1))*/
-void canopen_app_process();
+/* Returns the microseconds until the stack needs to run again (timerNext_us), UINT32_MAX when no
+ * object computes it, 0 to run again at once. Only meaningful with CO_CONFIG_FLAG_TIMERNEXT. */
+uint32_t canopen_app_process(void);
 /* Thread function executes in constant intervals, this function can be called from FreeRTOS tasks or Timers ********/
 void canopen_app_interrupt(void);
 
