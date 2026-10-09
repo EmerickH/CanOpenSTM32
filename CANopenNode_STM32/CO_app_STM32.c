@@ -42,9 +42,11 @@ CANopenNodeSTM32*
 #endif
 
 /* default values for CO_CANopenInit() */
+#ifndef NMT_CONTROL
 #define NMT_CONTROL                                                                                                    \
     CO_NMT_STARTUP_TO_OPERATIONAL                                                                                      \
     | CO_NMT_ERR_ON_ERR_REG | CO_ERR_REG_GENERIC_ERR | CO_ERR_REG_COMMUNICATION
+#endif
 #define FIRST_HB_TIME        500
 #define SDO_SRV_TIMEOUT_TIME 1000
 #define SDO_CLI_TIMEOUT_TIME 500
@@ -56,6 +58,7 @@ CO_t* CO = NULL; /* CANopen object */
 
 // Global variables
 uint32_t time_old, time_current;
+uint32_t interrupt_time_old;
 CO_ReturnError_t err;
 
 /* This function will basically setup the CANopen node */
@@ -111,6 +114,10 @@ canopen_app_init(CANopenNodeSTM32* _canopenNodeSTM32) {
 
     canopen_app_resetCommunication();
     return 0;
+}
+
+__weak uint32_t canopen_app_get_time(){
+	return HAL_GetTick() * 1000;
 }
 
 int
@@ -176,7 +183,8 @@ canopen_app_resetCommunication() {
     }
 
     /* Configure Timer interrupt function for execution every 1 millisecond */
-    HAL_TIM_Base_Start_IT(canopenNodeSTM32->timerHandle); //1ms interrupt
+    if(canopenNodeSTM32->timerHandle != NULL)
+    	HAL_TIM_Base_Start_IT(canopenNodeSTM32->timerHandle); //1ms interrupt
 
     /* Configure CAN transmit and receive interrupt */
 
@@ -197,7 +205,7 @@ canopen_app_resetCommunication() {
 
     log_printf("CANopenNode - Running...\n");
     fflush(stdout);
-    time_old = time_current = HAL_GetTick();
+    time_old = time_current = interrupt_time_old = canopen_app_get_time();
     return 0;
 }
 
@@ -205,12 +213,12 @@ void
 canopen_app_process() {
     /* loop for normal program execution ******************************************/
     /* get time difference since last function call */
-    time_current = HAL_GetTick();
+    time_current = canopen_app_get_time();
 
     if ((time_current - time_old) > 0) { // Make sure more than 1ms elapsed
         /* CANopen process */
         CO_NMT_reset_cmd_t reset_status;
-        uint32_t timeDifference_us = (time_current - time_old) * 1000;
+        uint32_t timeDifference_us = time_current - time_old;
         time_old = time_current;
         reset_status = CO_process(CO, false, timeDifference_us, NULL);
         canopenNodeSTM32->outStatusLEDRed = CO_LED_RED(CO->LEDs, CO_LED_CANopen);
@@ -237,7 +245,10 @@ canopen_app_interrupt(void) {
     if (!CO->nodeIdUnconfigured && CO->CANmodule->CANnormal) {
         bool_t syncWas = false;
         /* get time difference since last function call */
-        uint32_t timeDifference_us = 1000; // 1ms second
+        time_current = canopen_app_get_time();
+        uint32_t timeDifference_us = time_current - interrupt_time_old; // 1ms second
+        interrupt_time_old = time_current;
+        if(timeDifference_us == 0) timeDifference_us = 1000;
 
 #if (CO_CONFIG_SYNC) & CO_CONFIG_SYNC_ENABLE
         syncWas = CO_process_SYNC(CO, timeDifference_us, NULL);
