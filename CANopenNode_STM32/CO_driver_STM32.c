@@ -97,6 +97,24 @@ CO_CANsetNormalMode(CO_CANmodule_t* CANmodule) {
 }
 
 /******************************************************************************/
+#if defined(CO_STM32_FDCAN_Driver) && CO_STM32_PHY_COUNT == 1
+#define PRV_RX_FILTERS_MAX 28U /* standard filters of the FDCAN of the G0 */
+
+/* Filter `index` of the list: classic filter, ident and mask (a mask bit at 1 must match). */
+static HAL_StatusTypeDef
+prv_rx_filter(CO_CANmodule_t* CANmodule, uint16_t index, uint32_t ident, uint32_t mask, uint32_t config) {
+    FDCAN_FilterTypeDef filter = {
+        .IdType = FDCAN_STANDARD_ID,
+        .FilterIndex = index,
+        .FilterType = FDCAN_FILTER_MASK,
+        .FilterConfig = config,
+        .FilterID1 = ident,
+        .FilterID2 = mask,
+    };
+    return HAL_FDCAN_ConfigFilter(((CANopenNodeSTM32*)CANmodule->CANptr)->CANHandle, &filter);
+}
+#endif
+
 CO_ReturnError_t
 CO_CANmodule_init(CO_CANmodule_t* CANmodule, void* CANptr, CO_CANrx_t rxArray[], uint16_t rxSize, CO_CANtx_t txArray[],
                   uint16_t txSize, uint16_t CANbitRate) {
@@ -175,8 +193,24 @@ CO_CANmodule_init(CO_CANmodule_t* CANmodule, void* CANptr, CO_CANrx_t rxArray[],
      */
 
 #ifdef CO_STM32_FDCAN_Driver
-    if (HAL_FDCAN_ConfigGlobalFilter(((CANopenNodeSTM32*)CANptr)->CANHandle, FDCAN_ACCEPT_IN_RX_FIFO0, FDCAN_REJECT,
-                                     FDCAN_FILTER_REMOTE, FDCAN_FILTER_REMOTE)
+#if CO_STM32_PHY_COUNT == 1
+    /* One hardware filter per receive buffer (CO_CANrxBufferInit), the others rejected. More buffers than the 28
+     * filters of the FDCAN: accept all, software filters only. */
+    if (rxSize <= PRV_RX_FILTERS_MAX) {
+        FDCAN_HandleTypeDef* hfdcan = ((CANopenNodeSTM32*)CANptr)->CANHandle;
+        CANmodule->useCANrxFilters = true;
+        hfdcan->Init.StdFiltersNbr = rxSize; /* the list size (RXGFC.LSS) is written by HAL_FDCAN_Init only */
+        MODIFY_REG(hfdcan->Instance->RXGFC, FDCAN_RXGFC_LSS, (uint32_t)rxSize << FDCAN_RXGFC_LSS_Pos);
+        for (uint16_t i = 0U; i < rxSize; i++) {
+            if (prv_rx_filter(CANmodule, i, 0U, 0U, FDCAN_FILTER_DISABLE) != HAL_OK) {
+                return CO_ERROR_ILLEGAL_ARGUMENT;
+            }
+        }
+    }
+#endif
+    if (HAL_FDCAN_ConfigGlobalFilter(((CANopenNodeSTM32*)CANptr)->CANHandle,
+                                     CANmodule->useCANrxFilters ? FDCAN_REJECT : FDCAN_ACCEPT_IN_RX_FIFO0,
+                                     FDCAN_REJECT, FDCAN_FILTER_REMOTE, FDCAN_FILTER_REMOTE)
         != HAL_OK) {
         return CO_ERROR_ILLEGAL_ARGUMENT;
     }
@@ -289,9 +323,15 @@ CO_CANrxBufferInit(CO_CANmodule_t* CANmodule, uint16_t index, uint16_t ident, ui
         buffer->mask = (mask & CANID_MASK) | FLAG_RTR;
 
         /* Set CAN hardware module filter and mask. */
-        if (CANmodule->useCANrxFilters) {
-            __NOP();
+#if defined(CO_STM32_FDCAN_Driver) && CO_STM32_PHY_COUNT == 1
+        /* Filter of the buffer: same ident and mask (a classic filter can't test RTR: the software match does). Ident 0
+         * is the NMT command (and the buffers not used): it stays open. */
+        if (CANmodule->useCANrxFilters
+            && prv_rx_filter(CANmodule, index, ident & CANID_MASK, mask & CANID_MASK, FDCAN_FILTER_TO_RXFIFO0)
+                   != HAL_OK) {
+            ret = CO_ERROR_ILLEGAL_ARGUMENT;
         }
+#endif
     } else {
         ret = CO_ERROR_ILLEGAL_ARGUMENT;
     }
@@ -958,22 +998,14 @@ prv_read_can_received_msg(CAN_HandleTypeDef* hcan, uint32_t fifo, uint32_t fifo_
 #endif
 
     /*
-     * Hardware filters are not used for the moment
-     * \todo: Implement hardware filters...
+     * Palais: the hardware filters (single-bus builds) only keep the other frames of the bus out: they can't
+     * test RTR and the FIFO doesn't give the buffer, so the message ID is always matched with all buffers
      */
-    if (CANModule_local->useCANrxFilters) {
-        __BKPT(0);
-    } else {
-        /*
-         * We are not using hardware filters, hence it is necessary
-         * to manually match received message ID with all buffers
-         */
-        buffer = CANModule_local->rxArray;
-        for (index = CANModule_local->rxSize; index > 0U; --index, ++buffer) {
-            if (((rcvMsgIdent ^ buffer->ident) & buffer->mask) == 0U) {
-                messageFound = 1;
-                break;
-            }
+    buffer = CANModule_local->rxArray;
+    for (index = CANModule_local->rxSize; index > 0U; --index, ++buffer) {
+        if (((rcvMsgIdent ^ buffer->ident) & buffer->mask) == 0U) {
+            messageFound = 1;
+            break;
         }
     }
 
