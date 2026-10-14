@@ -161,6 +161,9 @@ typedef struct {
  * Tx: whether the frame goes on bus phy; *ident and data (8 bytes, a copy) are rewritten for that bus. */
 bool CO_CANphyRx(uint8_t phy, uint16_t* ident, const uint8_t* data, uint8_t dlc);
 bool CO_CANphyTx(uint8_t phy, uint16_t* ident, uint8_t* data, uint8_t dlc);
+/* Every frame as on bus phy (physical ident): received (tx false, before CO_CANphyRx), or given to its TX FIFO
+ * (tx true). Same context and rules as above. */
+void CO_CANphyTap(uint8_t phy, bool tx, uint16_t ident, bool rtr, const uint8_t* data, uint8_t dlc);
 
 /* Bits of a standard data frame on the bus with the interframe space, without the stuff bits (up to ~20 % more):
  * a lower bound */

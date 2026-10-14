@@ -427,6 +427,7 @@ prv_route_send(CO_CANmodule_t* CANmodule, const CO_CANtx_t* buffer, uint8_t phys
         }
         if (prv_send_frame(prv_phy_handle(CANmodule, p), (buffer->ident & FLAG_RTR) | ident, buffer->DLC, data)) {
             *sent = true;
+            CO_CANphyTap(p, true, ident, (buffer->ident & FLAG_RTR) != 0, data, buffer->DLC);
             CANmodule->txFrames[p]++;
             CANmodule->txBits[p] += CO_CANPHY_FRAME_BITS(buffer->DLC);
         } else {
@@ -976,6 +977,8 @@ prv_read_can_received_msg(CAN_HandleTypeDef* hcan, uint32_t fifo, uint32_t fifo_
         CANModule_local->up[phy] = true;
         CANModule_local->rxFrames[phy]++;
         CANModule_local->rxBits[phy] += CO_CANPHY_FRAME_BITS(rcvMsg.dlc);
+        CO_CANphyTap(phy, false, (uint16_t)(rcvMsg.ident & CANID_MASK), (rcvMsg.ident & FLAG_RTR) != 0, rcvMsg.data,
+                     rcvMsg.dlc);
 
         uint16_t ident = (uint16_t)(rcvMsg.ident & CANID_MASK);
         if (!CO_CANphyRx(phy, &ident, rcvMsg.data, rcvMsg.dlc)) {
